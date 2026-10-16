@@ -442,24 +442,6 @@ static int sufs_view_expose(char *args)
 
 	SUSFS_LOGI("sufs_fs: exposed %s at %s (view now holds %d name(s))\n", real, view, sufs_nviews);
 
-	/* The listing IS the dcache: the root uses simple_dir_operations (dcache_readdir), so a name
-	 * shows up in "ls" exactly while it has a dentry here.  Building the dentry by hand instead of
-	 * emitting the entry ourselves is deliberate - dir_emit() invokes the kernel's actor pointer,
-	 * an indirect call into the kernel, and on these builds __nocfi did not keep the CFI check out
-	 * of that function (measured: the CFI call-site gate kept finding the relocation, and a checked
-	 * call there panics at run time).  Handing the emitting to the kernel removes the question. */
-	if (sufs_view_root) {
-		struct inode *inode = sufs_view_inode(sufs_view_root->d_sb);
-
-		if (!IS_ERR(inode)) {
-			struct dentry *d = d_alloc_name(sufs_view_root, name);
-
-			if (d)
-				d_add(d, inode);	/* consumes the reference */
-			else
-				iput(inode);
-		}
-	}
 	return 0;
 }
 
