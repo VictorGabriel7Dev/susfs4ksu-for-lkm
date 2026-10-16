@@ -367,6 +367,7 @@ static int sufs_view_expose(char *args)
 	char view[SUSFS_OR_PATH_MAX];
 	char *name = args, *real;
 	unsigned long ino;
+	int i;
 	int rc;
 
 	real = strchr(args, ' ');
@@ -405,20 +406,45 @@ static int sufs_view_expose(char *args)
 
 	ino = sufs_view_ino_alloc_locked();
 
+	/* Give the name a dentry - by running one real LOOKUP, not by building one here.  A dentry we
+	 * allocate ourselves (d_alloc_name() + d_add()) carries a reference nobody hands back, and the
+	 * unmount then reports it: shrink_dcache_parent() collects only d_lockref.count == 0 children,
+	 * while our extra reference made it 1 (BUG: ... still in use (1)); "handing it back" with
+	 * dput() overshot to -1, because after d_add() that reference is the dcache's already.  A
+	 * lookup has neither problem: the VFS owns the reference for the walk and drops it on the way
+	 * out, leaving the dentry in the dcache at count 0 - listed, and collectable at teardown.  The
+	 * table entry written just above is what the lookup finds. */
+	if (sufs_view_root) {
+		struct path p;
+
+		if (kern_path(view, 0, &p) == 0)
+			path_put(&p);
+	}
+
+	/* The rule only now: or_add() resolves its target to an inode, so the view path has to exist
+	 * first - adding it earlier came back -ENOENT (measured: "expose ... failed -2"). */
 	rc = susfs_open_redirect_add_view_rule(view, real);
 	if (rc) {
+		/* Roll back: name out of the listing, entry out of the table, nothing left half-added. */
+		if (sufs_view_root) {
+			struct path p;
+
+			if (kern_path(view, 0, &p) == 0) {
+				d_drop(p.dentry);
+				path_put(&p);
+			}
+		}
+		mutex_lock(&sufs_views_lock);
+		i = sufs_view_find_locked(name);
+		if (i >= 0) {
+			memmove(&sufs_views[i], &sufs_views[i + 1],
+				(size_t)(sufs_nviews - i - 1) * sizeof(sufs_views[0]));
+			sufs_nviews--;
+		}
+		mutex_unlock(&sufs_views_lock);
 		pr_warn("sufs_fs: expose %s -> %s failed %d\n", view, real, rc);
 		return rc;
 	}
-
-	{
-		struct sufs_view_entry *e = &sufs_views[sufs_nviews++];
-
-		strscpy(e->name, name, sizeof(e->name));
-		strscpy(e->real, real, sizeof(e->real));
-		e->ino = ino;
-	}
-	mutex_unlock(&sufs_views_lock);
 
 	SUSFS_LOGI("sufs_fs: exposed %s at %s (view now holds %d name(s))\n", real, view, sufs_nviews);
 
