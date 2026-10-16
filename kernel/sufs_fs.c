@@ -63,12 +63,15 @@
  * demand (see sufs_make_ctl_inode() for the WARN that on-demand creation produced). */
 #define SUFS_ROOT_INO		1
 #define SUFS_CTL_INO		2
-/* The view's placeholder inode: every name under the view that is not "control" resolves to this
- * ONE inode.  It exists because an open_redirect rule needs its target to resolve to an inode
- * (or_add() calls kern_path() on it) - the placeholder is that target, and the rule is what turns
- * an open of the view path into the real file.  Shared rather than one per name: the view's name
- * set is dynamic, and M1's lesson was that a per-visit inode is never evicted. */
-#define SUFS_VIEW_INO		3
+/* The first inode number a view name may get.  Each name gets its OWN inode, and that is not a
+ * detail: open_redirect matches a rule by INODE (or_find_by_inode(ino, dev, igen)), so names that
+ * shared one inode would all hit the same rule - measured: a name with no rule of its own read the
+ * real file of another one.  Sharing is also what the first version did, and unmounting then
+ * reported "BUG: Dentry ...{i=3,n=hello} still in use (-1)" once per name.
+ *
+ * The numbers are recycled from an explicit free pool, so the inode count stays bounded by
+ * SUFS_VIEW_MAX rather than by how many exposes have ever run. */
+#define SUFS_VIEW_INO_BASE	3
 
 /* ---- the switch, and where the view is mounted ------------------------------------------
  * Both are 0600: they decide where a root-only view appears on the filesystem, which is not
@@ -114,12 +117,33 @@ static DEFINE_MUTEX(sufs_ctl_lock);
 struct sufs_view_entry {
 	char name[SUFS_VIEW_NAME_MAX];
 	char real[SUSFS_OR_PATH_MAX];
-	bool rule_live;
+	unsigned long ino;	/* this name's own inode number; 0 = free slot */
 };
 
 static struct sufs_view_entry sufs_views[SUFS_VIEW_MAX];
 static int sufs_nviews;
 static DEFINE_MUTEX(sufs_views_lock);
+
+/* Caller holds sufs_views_lock.  Lowest free number at or above SUFS_VIEW_INO_BASE. */
+static unsigned long sufs_view_ino_alloc_locked(void)
+{
+	unsigned long ino = SUFS_VIEW_INO_BASE;
+	int i;
+
+	for (;;) {
+		bool used = false;
+
+		for (i = 0; i < sufs_nviews; i++) {
+			if (sufs_views[i].ino == ino) {
+				used = true;
+				break;
+			}
+		}
+		if (!used)
+			return ino;
+		ino++;
+	}
+}
 
 /* Caller holds sufs_views_lock. */
 static int sufs_view_find_locked(const char *name)
@@ -179,9 +203,8 @@ static ssize_t sufs_ctl_read(struct file *file, char __user *buf, size_t len, lo
 		int i;
 
 		for (i = 0; i < sufs_nviews && n < (int)sizeof(tmp) - 96; i++)
-			n += scnprintf(tmp + n, sizeof(tmp) - n, "sufs: view %s -> %s (rule=%d)\n",
-				       sufs_views[i].name, sufs_views[i].real,
-				       sufs_views[i].rule_live ? 1 : 0);
+			n += scnprintf(tmp + n, sizeof(tmp) - n, "sufs: view %s -> %s (ino=%lu)\n",
+				       sufs_views[i].name, sufs_views[i].real, sufs_views[i].ino);
 	}
 	mutex_unlock(&sufs_views_lock);
 	mutex_unlock(&sufs_ctl_lock);
@@ -311,9 +334,9 @@ static const struct file_operations sufs_view_fops = {
 	.write = sufs_view_write,
 };
 
-static struct inode *sufs_view_inode(struct super_block *sb)
+static struct inode *sufs_view_inode(struct super_block *sb, unsigned long ino)
 {
-	struct inode *inode = iget_locked(sb, SUFS_VIEW_INO);
+	struct inode *inode = iget_locked(sb, ino);
 
 	if (!inode)
 		return ERR_PTR(-ENOMEM);
@@ -343,6 +366,9 @@ static int sufs_view_expose(char *args)
 {
 	char view[SUSFS_OR_PATH_MAX];
 	char *name = args, *real;
+	struct dentry *d = NULL;
+	struct inode *inode;
+	unsigned long ino;
 	int rc;
 
 	real = strchr(args, ' ');
@@ -365,7 +391,9 @@ static int sufs_view_expose(char *args)
 
 	/* Claim the slot BEFORE the rule exists, so a name is never listed without a rule behind it.
 	 * (Two concurrent exposes could still both pass this check; the second one then fails to add
-	 * its rule in a way that leaves nothing half-done - see below.) */
+	 * its rule in a way that leaves nothing half-done - see below.)  The lock is held across the
+	 * inode allocation and the table write; the rule and the dentry are built in between, which is
+	 * why a failure below has to undo what is already visible. */
 	mutex_lock(&sufs_views_lock);
 	if (sufs_view_find_locked(name) >= 0) {
 		mutex_unlock(&sufs_views_lock);
@@ -377,26 +405,38 @@ static int sufs_view_expose(char *args)
 	}
 	mutex_unlock(&sufs_views_lock);
 
+	ino = sufs_view_ino_alloc_locked();
+
+	/* The dentry first: the listing is the dcache, and a name must be visible exactly while it
+	 * works.  d_add() consumes the inode reference. */
+	if (sufs_view_root) {
+		inode = sufs_view_inode(sufs_view_root->d_sb, ino);
+		if (IS_ERR(inode))
+			return PTR_ERR(inode);
+		d = d_alloc_name(sufs_view_root, name);
+		if (!d) {
+			iput(inode);
+			return -ENOMEM;
+		}
+		d_add(d, inode);
+	}
+
 	rc = susfs_open_redirect_add_view_rule(view, real);
 	if (rc) {
+		if (d) {
+			d_drop(d);
+			dput(d);
+		}
 		pr_warn("sufs_fs: expose %s -> %s failed %d\n", view, real, rc);
 		return rc;
 	}
 
-	mutex_lock(&sufs_views_lock);
-	if (sufs_view_find_locked(name) >= 0 || sufs_nviews >= SUFS_VIEW_MAX) {
-		/* Lost a race after all.  The rule is live but unlisted; saying so is the honest end -
-		 * unexpose will not find it either, and the status line is where that shows up. */
-		mutex_unlock(&sufs_views_lock);
-		pr_warn("sufs_fs: expose %s: rule added but the name table did not take it\n", name);
-		return -EEXIST;
-	}
 	{
 		struct sufs_view_entry *e = &sufs_views[sufs_nviews++];
 
 		strscpy(e->name, name, sizeof(e->name));
 		strscpy(e->real, real, sizeof(e->real));
-		e->rule_live = true;
+		e->ino = ino;
 	}
 	mutex_unlock(&sufs_views_lock);
 
@@ -449,7 +489,7 @@ static int sufs_view_unexpose(char *args)
 	}
 	memmove(&sufs_views[i], &sufs_views[i + 1],
 		(size_t)(sufs_nviews - i - 1) * sizeof(sufs_views[0]));
-	sufs_nviews--;
+	sufs_nviews--;	/* the entry's ino goes back to the pool with it */
 	mutex_unlock(&sufs_views_lock);
 
 	susfs_open_redirect_del_view_rule(view);
@@ -473,6 +513,7 @@ static int sufs_view_unexpose(char *args)
  * VFS refuses to call into a directory whose i_op has no ->lookup. */
 static struct dentry *sufs_lookup(struct inode *dir, struct dentry *dentry, unsigned int flags)
 {
+	char name[SUFS_VIEW_NAME_MAX];
 	struct inode *inode;
 
 	if (dentry->d_name.len == sizeof(SUFS_CTL_NAME) - 1 &&
@@ -485,10 +526,29 @@ static struct dentry *sufs_lookup(struct inode *dir, struct dentry *dentry, unsi
 		return d_splice_alias(inode, dentry);
 	}
 
-	inode = sufs_view_inode(dir->i_sb);
-	if (IS_ERR(inode))
-		return ERR_CAST(inode);
-	return d_splice_alias(inode, dentry);
+	/* Everything else exists only if the table says so: a name that was never exposed must be a
+	 * negative dentry, i.e. really nothing, not a placeholder. */
+	if (dentry->d_name.len < sizeof(name)) {
+		unsigned long ino = 0;
+		int i;
+
+		memcpy(name, dentry->d_name.name, dentry->d_name.len);
+		name[dentry->d_name.len] = '\0';
+
+		mutex_lock(&sufs_views_lock);
+		i = sufs_view_find_locked(name);
+		if (i >= 0)
+			ino = sufs_views[i].ino;
+		mutex_unlock(&sufs_views_lock);
+
+		if (ino) {
+			inode = sufs_view_inode(dir->i_sb, ino);
+			if (IS_ERR(inode))
+				return ERR_CAST(inode);
+			return d_splice_alias(inode, dentry);
+		}
+	}
+	return NULL;
 }
 
 /* The view root's listing, built from the NAME TABLE rather than from the dcache: a listing that
