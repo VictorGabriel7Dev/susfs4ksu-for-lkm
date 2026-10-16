@@ -407,9 +407,21 @@ static int sufs_view_expose(char *args)
 		mutex_unlock(&sufs_views_lock);
 		return -ENOSPC;
 	}
-	mutex_unlock(&sufs_views_lock);
-
+	/* The name goes into the table FIRST, and that ordering is load-bearing: the table is what
+	 * decides whether a name exists at all, so the lookup below hands out an inode only because
+	 * this entry is already here.  Measured the other way round: registering after the rule came
+	 * back -ENOENT ("expose ... failed -2"), because the lookup that was meant to create the
+	 * dentry found no name in the table, answered with a negative dentry, and left or_add() with
+	 * nothing to resolve.  A failure below therefore has to take this entry out again. */
 	ino = sufs_view_ino_alloc_locked();
+	{
+		struct sufs_view_entry *e = &sufs_views[sufs_nviews++];
+
+		strscpy(e->name, name, sizeof(e->name));
+		strscpy(e->real, real, sizeof(e->real));
+		e->ino = ino;
+	}
+	mutex_unlock(&sufs_views_lock);
 
 	/* Give the name a dentry - by running one real LOOKUP, not by building one here.  A dentry we
 	 * allocate ourselves (d_alloc_name() + d_add()) carries a reference nobody hands back, and the
