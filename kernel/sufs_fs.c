@@ -99,6 +99,38 @@ bool sufs_fs_registered(void)
  * content lives in module memory (no page cache, no backing store), which is exactly the
  * point - it disappears with the module and leaves nothing on disk. */
 static DEFINE_MUTEX(sufs_ctl_lock);
+
+/* ---- the view name table: the single source of truth --------------------------------------
+ * "What is in the view" used to be recoverable only from two histories - the dcache (whatever had
+ * happened to be looked up) and open_redirect's own rule table.  This is the state instead: one
+ * entry per exposed name, written by the commands, and read by the status line, by lookup (to
+ * decide whether a name exists at all) and - once the directory listing lands - by readdir.
+ *
+ * SUFS_VIEW_MAX is this layer's own bound; open_redirect has its own slot limit below it, and an
+ * expose that cannot get a rule fails here rather than being recorded and silently inert. */
+#define SUFS_VIEW_MAX		16
+#define SUFS_VIEW_NAME_MAX	64
+
+struct sufs_view_entry {
+	char name[SUFS_VIEW_NAME_MAX];
+	char real[SUSFS_OR_PATH_MAX];
+	bool rule_live;
+};
+
+static struct sufs_view_entry sufs_views[SUFS_VIEW_MAX];
+static int sufs_nviews;
+static DEFINE_MUTEX(sufs_views_lock);
+
+/* Caller holds sufs_views_lock. */
+static int sufs_view_find_locked(const char *name)
+{
+	int i;
+
+	for (i = 0; i < sufs_nviews; i++)
+		if (!strcmp(sufs_views[i].name, name))
+			return i;
+	return -1;
+}
 static char sufs_ctl_last[SUFS_CTL_BUF];
 static size_t sufs_ctl_last_len;
 static atomic_t sufs_ctl_reads = ATOMIC_INIT(0);
@@ -297,38 +329,6 @@ static struct inode *sufs_view_inode(struct super_block *sb)
 /* The control inode, and the one reference this filesystem keeps on purpose: it is what a lookup
  * evicted from the dcache gets handed back (see sufs_lookup below).  Released in put_super(). */
 static struct inode *sufs_ctl_inode;
-
-/* ---- the view name table: the single source of truth --------------------------------------
- * "What is in the view" used to be recoverable only from two histories - the dcache (whatever had
- * happened to be looked up) and open_redirect's own rule table.  This is the state instead: one
- * entry per exposed name, written by the commands, and read by the status line, by lookup (to
- * decide whether a name exists at all) and - once the directory listing lands - by readdir.
- *
- * SUFS_VIEW_MAX is this layer's own bound; open_redirect has its own slot limit below it, and an
- * expose that cannot get a rule fails here rather than being recorded and silently inert. */
-#define SUFS_VIEW_MAX		16
-#define SUFS_VIEW_NAME_MAX	64
-
-struct sufs_view_entry {
-	char name[SUFS_VIEW_NAME_MAX];
-	char real[SUSFS_OR_PATH_MAX];
-	bool rule_live;
-};
-
-static struct sufs_view_entry sufs_views[SUFS_VIEW_MAX];
-static int sufs_nviews;
-static DEFINE_MUTEX(sufs_views_lock);
-
-/* Caller holds sufs_views_lock. */
-static int sufs_view_find_locked(const char *name)
-{
-	int i;
-
-	for (i = 0; i < sufs_nviews; i++)
-		if (!strcmp(sufs_views[i].name, name))
-			return i;
-	return -1;
-}
 
 /* expose <view-name> <real-path> - the whole command surface for now.  Small on purpose: the shape
  * of the view is still being settled, and a command that is not here cannot be misused. */
