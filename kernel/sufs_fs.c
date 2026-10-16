@@ -466,13 +466,23 @@ static struct dentry *sufs_lookup(struct inode *dir, struct dentry *dentry, unsi
  * on these builds (the module's type hash for a kernel prototype is not the kernel's).  This is
  * the same rule every other indirect call in this module follows.  The kernel calling THIS
  * function back through file_operations->iterate_shared is the other direction and unaffected. */
-static int __nocfi sufs_dir_iterate(struct file *file, struct dir_context *ctx)
+/* dir_emit() calls ctx->actor(), a kernel function pointer, and the enclosing function therefore
+ * has to be __nocfi - the same attribute every other indirect call into the kernel in this module
+ * sits behind.  noinline is deliberate: LTO is otherwise free to inline this into its caller and
+ * re-instrument the call there (the build workflow's own note records that failure mode). */
+static __nocfi noinline int sufs_emit(struct dir_context *ctx, const char *name, int len,
+				      unsigned long ino)
+{
+	return dir_emit(ctx, name, len, ino, DT_REG);
+}
+
+static __nocfi int sufs_dir_iterate(struct file *file, struct dir_context *ctx)
 {
 	if (!dir_emit_dots(file, ctx))
 		return 0;
 
 	if (ctx->pos == 2) {
-		if (!dir_emit(ctx, SUFS_CTL_NAME, sizeof(SUFS_CTL_NAME) - 1, SUFS_CTL_INO, DT_REG))
+		if (!sufs_emit(ctx, SUFS_CTL_NAME, sizeof(SUFS_CTL_NAME) - 1, SUFS_CTL_INO))
 			return 0;
 		ctx->pos = 3;
 	}
@@ -490,7 +500,7 @@ static int __nocfi sufs_dir_iterate(struct file *file, struct dir_context *ctx)
 		mutex_unlock(&sufs_views_lock);
 
 		ctx->pos++;
-		if (!dir_emit(ctx, name, strlen(name), SUFS_VIEW_INO, DT_REG))
+		if (!sufs_emit(ctx, name, strlen(name), SUFS_VIEW_INO))
 			return 0;
 	}
 	return 0;
