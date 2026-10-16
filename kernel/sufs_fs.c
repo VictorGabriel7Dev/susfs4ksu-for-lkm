@@ -52,6 +52,7 @@
 #include "susfs.h"
 #include "susfs_log.h"
 #include "symbol_resolver.h"
+#include "ksu_allow_gate.h"	/* the privileged-view predicate (M3) */
 
 #define SUFS_FS_NAME		"sufs"
 #define SUFS_MNTPT_DEFAULT	"/data/misc/update_engine/sufs"
@@ -194,8 +195,12 @@ static ssize_t sufs_ctl_read(struct file *file, char __user *buf, size_t len, lo
 	mutex_lock(&sufs_ctl_lock);
 	mutex_lock(&sufs_views_lock);
 	n = scnprintf(tmp, sizeof(tmp),
-		      "sufs: node=%s privfs=%d views=%d reads=%d writes=%d denied=%d last=\"%s\"\n",
+		      "sufs: node=%s privfs=%d views=%d allow=self:%d/uid0:%d/uid10000:%d/off:%d reads=%d writes=%d denied=%d last=\"%s\"\n",
 		      SUFS_CTL_NAME, sufs_privfs ? 1 : 0, sufs_nviews,
+		      susfs_ksu_allow_current() ? 1 : 0,
+		      susfs_ksu_allow_uid(0) ? 1 : 0,
+		      susfs_ksu_allow_uid(10000) ? 1 : 0,
+		      READ_ONCE(susfs_ksu_allow_gate_off) ? 1 : 0,
 		      atomic_read(&sufs_ctl_reads), atomic_read(&sufs_ctl_writes),
 		      atomic_read(&sufs_ctl_denied),
 		      sufs_ctl_last_len ? sufs_ctl_last : "(none)");

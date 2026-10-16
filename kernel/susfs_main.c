@@ -14,6 +14,7 @@
 #include "patch_memory.h"	/* ksu_patch_memory_init(): the flush helper's name differs per kernel */
 #include "susfs_log.h"
 #include "ksu_umount_gate.h"
+#include "ksu_allow_gate.h"	/* KernelSU's allow predicate (M3: the privileged-view predicate) */
 #include "lsm_hook.h"
 #include "susfs.h"
 #include "susfs_opath.h"	/* SUSFS_OPATH_NODE + the layer's init/exit */
@@ -110,6 +111,9 @@ static struct {
      * failure here is a degradation, not a reason to refuse the module.  Skipping this init entirely
      * (fail_layer=1) is safe for the same reason: the flag it sets defaults to the pre-#34 answer. */
     { "ksu_umount_gate", susfs_ksu_umount_gate_init,	NULL,			false, false },
+    /* Resolves KernelSU's allow predicate by name.  Non-fatal on purpose: without the symbol the
+     * predicate falls back to uid == 0, which loses features rather than leaking them. */
+    { "ksu_allow_gate",	susfs_ksu_allow_gate_init,	NULL,			false, false },
     { "lsm_hook",	layer_lsm_hook_init,		ksu_lsm_hook_exit,	false, false },
     { "sus_path",	sus_path_init,			sus_path_exit,		true,  false },
     /* After sus_path, because this layer asks sus_path's rule table for every open it
