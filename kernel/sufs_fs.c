@@ -62,6 +62,12 @@
  * demand (see sufs_make_ctl_inode() for the WARN that on-demand creation produced). */
 #define SUFS_ROOT_INO		1
 #define SUFS_CTL_INO		2
+/* The view's placeholder inode: every name under the view that is not "control" resolves to this
+ * ONE inode.  It exists because an open_redirect rule needs its target to resolve to an inode
+ * (or_add() calls kern_path() on it) - the placeholder is that target, and the rule is what turns
+ * an open of the view path into the real file.  Shared rather than one per name: the view's name
+ * set is dynamic, and M1's lesson was that a per-visit inode is never evicted. */
+#define SUFS_VIEW_INO		3
 
 /* ---- the switch, and where the view is mounted ------------------------------------------
  * Both are 0600: they decide where a root-only view appears on the filesystem, which is not
@@ -170,6 +176,22 @@ static ssize_t sufs_ctl_write(struct file *file, const char __user *buf, size_t 
 	sufs_ctl_last_len = n;
 	mutex_unlock(&sufs_ctl_lock);
 
+	/* Commands.  The first one is the point of M2: expose a REAL file at a view name, so the
+	 * privileged side reads it there while the unprivileged side has nothing to find - the view
+	 * sits under a 0700 host, so an app is refused by the host's own DAC rather than by an answer
+	 * this module forged.  Unknown commands are REFUSED, never silently recorded. */
+	if (!strncmp(tmp, "expose ", 7)) {
+		int rc = sufs_view_expose(tmp + 7);
+
+		if (rc) {
+			atomic_inc(&sufs_ctl_denied);
+			return rc;
+		}
+	} else if (strcmp(tmp, "status") && strcmp(tmp, "ping")) {
+		atomic_inc(&sufs_ctl_denied);
+		return -EINVAL;
+	}
+
 	atomic_inc(&sufs_ctl_writes);
 	SUSFS_LOGI("sufs_fs: control write \"%s\"\n", tmp);
 	return len;
@@ -211,12 +233,103 @@ static struct inode *sufs_make_ctl_inode(struct super_block *sb)
 	return inode;
 }
 
-/* A lookup that gets here is a miss by definition - everything this filesystem has is already in
- * the dcache (see sufs_fill_super()) - so the honest answer is a negative dentry.  The method
- * itself must exist: the VFS refuses to call into a directory whose i_op has no ->lookup. */
+/* What a view name answers when it is opened WITHOUT a matching rule: a sentence instead of an
+ * error, so "no rule for this name" stays distinguishable from "the mechanism is broken". */
+static ssize_t sufs_view_read(struct file *file, char __user *buf, size_t len, loff_t *ppos)
+{
+	static const char msg[] = "sufs: view placeholder - no open_redirect rule matched this name\n";
+
+	return simple_read_from_buffer(buf, len, ppos, (void *)msg, sizeof(msg) - 1);
+}
+
+static ssize_t sufs_view_write(struct file *file, const char __user *buf, size_t len,
+			       loff_t *ppos)
+{
+	return -EIO;
+}
+
+/* No .llseek on purpose: vfs_llseek() substitutes its own default (no_llseek) when the method is
+ * absent, so the spelling 6.12 renamed never has to appear here. */
+static const struct file_operations sufs_view_fops = {
+	.owner = THIS_MODULE,
+	.read = sufs_view_read,
+	.write = sufs_view_write,
+};
+
+static struct inode *sufs_view_inode(struct super_block *sb)
+{
+	struct inode *inode = iget_locked(sb, SUFS_VIEW_INO);
+
+	if (!inode)
+		return ERR_PTR(-ENOMEM);
+	if (inode->i_state & I_NEW) {
+		inode->i_mode = S_IFREG | 0600;
+		inode->i_uid = GLOBAL_ROOT_UID;
+		inode->i_gid = GLOBAL_ROOT_GID;
+		inode->i_fop = &sufs_view_fops;
+		inode->i_size = 0;
+		sufs_set_times(inode);
+		unlock_new_inode(inode);
+	}
+	return inode;
+}
+
+/* The control inode, and the one reference this filesystem keeps on purpose: it is what a lookup
+ * evicted from the dcache gets handed back (see sufs_lookup below).  Released in put_super(). */
+static struct inode *sufs_ctl_inode;
+
+/* expose <view-name> <real-path> - the whole command surface for now.  Small on purpose: the shape
+ * of the view is still being settled, and a command that is not here cannot be misused. */
+static int sufs_view_expose(char *args)
+{
+	char view[SUSFS_OR_PATH_MAX];
+	char *name = args, *real;
+	int rc;
+
+	real = strchr(args, ' ');
+	if (!real)
+		return -EINVAL;
+	*real++ = '\0';
+	while (*real == ' ')
+		real++;
+	if (!*name || !*real)
+		return -EINVAL;
+	/* A view name is ONE path component: it may not walk out of the view. */
+	if (strchr(name, '/') || !strcmp(name, ".") || !strcmp(name, ".."))
+		return -EINVAL;
+	if (strlen(sufs_mnt_point) + 1 + strlen(name) + 1 > sizeof(view))
+		return -ENAMETOOLONG;
+
+	scnprintf(view, sizeof(view), "%s/%s", sufs_mnt_point, name);
+	rc = susfs_open_redirect_add_view_rule(view, real);
+	if (rc)
+		pr_warn("sufs_fs: expose %s -> %s failed %d\n", view, real, rc);
+	else
+		SUSFS_LOGI("sufs_fs: exposed %s at %s\n", real, view);
+	return rc;
+}
+
+/* A lookup that gets here is a miss: "control" is bound in the dcache at mount time, and every
+ * other name is a view name that exists as the placeholder.  The method itself must exist - the
+ * VFS refuses to call into a directory whose i_op has no ->lookup. */
 static struct dentry *sufs_lookup(struct inode *dir, struct dentry *dentry, unsigned int flags)
 {
-	return NULL;
+	struct inode *inode;
+
+	if (dentry->d_name.len == sizeof(SUFS_CTL_NAME) - 1 &&
+	    !memcmp(dentry->d_name.name, SUFS_CTL_NAME, sizeof(SUFS_CTL_NAME) - 1)) {
+		if (!sufs_ctl_inode)
+			return NULL;
+		inode = igrab(sufs_ctl_inode);
+		if (!inode)
+			return NULL;
+		return d_splice_alias(inode, dentry);
+	}
+
+	inode = sufs_view_inode(dir->i_sb);
+	if (IS_ERR(inode))
+		return ERR_CAST(inode);
+	return d_splice_alias(inode, dentry);
 }
 
 static const struct inode_operations sufs_dir_iops = {
@@ -227,8 +340,20 @@ static const struct inode_operations sufs_dir_iops = {
  * one crashes on the first inode allocation.  There is deliberately no .drop_inode: the default
  * (evict once i_nlink reaches 0) is what generic_delete_inode() did, and that symbol is gone
  * from 6.12 on; the node's single cached inode makes accumulating anything impossible. */
+static void sufs_put_super(struct super_block *sb)
+{
+	/* The one reference fill_super() took for ->lookup; the dcache's own reference left with
+	 * d_add().  The placeholder inode needs no such care: iget_locked() gave it a normal
+	 * dcache-owned life. */
+	if (sufs_ctl_inode) {
+		iput(sufs_ctl_inode);
+		sufs_ctl_inode = NULL;
+	}
+}
+
 static const struct super_operations sufs_sops = {
 	.statfs = simple_statfs,
+	.put_super = sufs_put_super,
 };
 
 static int sufs_fill_super(struct super_block *sb, struct fs_context *fc)
@@ -268,6 +393,9 @@ static int sufs_fill_super(struct super_block *sb, struct fs_context *fc)
 		iput(ctl);
 		return -ENOMEM;
 	}
+	/* Our own reference first (igrab), then hand the original one to the dcache: that leaves
+	 * exactly one reference in this filesystem's hands, released by put_super(). */
+	sufs_ctl_inode = igrab(ctl);
 	d_add(cd, ctl);
 	return 0;
 }

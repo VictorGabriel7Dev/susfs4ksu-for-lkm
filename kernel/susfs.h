@@ -200,6 +200,10 @@ bool susfs_open_redirect_spoof_ids(unsigned long ino, unsigned long *out_ino, un
  * nothing inside an entry may be read after the lookup returns. */
 bool susfs_open_redirect_match_path(const struct path *path, char *buf, size_t buflen);
 
+/* Add an open_redirect rule for the privileged view (kernel/sufs_fs.c): opening @view_path
+ * (a placeholder name under the view mount) lands on @real_path.  Used only with privfs=1. */
+int susfs_open_redirect_add_view_rule(const char *view_path, const char *real_path);
+
 /* How many rules are live right now.  The name-layer hook runs for every open() on the system, so it
  * tests this before it resolves anything - a table with no live rule costs one load instead of a path
  * lookup, and deleting the last rule takes that cost away again.  Written under the rule lock. */

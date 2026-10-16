@@ -959,6 +959,20 @@ static const struct proc_ops or_proc_ops = {
 
 static struct proc_dir_entry *or_proc_entry;
 
+/* The privileged view's rule: expose a REAL file at a view path (kernel/sufs_fs.c).  Same
+ * mechanism as every other rule - the difference is who creates it and what it is for.  A rule
+ * needs its target to resolve to an inode (or_add() below), which is exactly why the view answers
+ * every unknown name with a placeholder inode: that placeholder is the target, and this rule is
+ * what turns an open of it into the real file.
+ *
+ * Scheme UID_NON_APP_PROC: the callers that matter are root/su.  The unprivileged side is not
+ * filtered by this rule at all - it never reaches the view path, because the view is mounted under
+ * a 0700 root host directory and the kernel refuses it at the host. */
+int susfs_open_redirect_add_view_rule(const char *view_path, const char *real_path)
+{
+	return or_add(view_path, real_path, UID_NON_APP_PROC);
+}
+
 int susfs_open_redirect_init(void)
 {
 	int i;
