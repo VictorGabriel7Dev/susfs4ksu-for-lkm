@@ -57,9 +57,9 @@
 #define SUFS_CTL_NAME		"control"
 #define SUFS_CTL_BUF		256
 #define SUFS_MAGIC		0x53465553	/* "SUFS" */
-/* Fixed inode numbers: the first is the root d_make_root() owns, the second the one node, which
- * is kept in the inode cache through iget_locked() so that unrelated lookups share one inode
- * instead of allocating (and never freeing) a fresh one per lookup. */
+/* Fixed inode numbers: the first is the root d_make_root() owns, the second is the one node.
+ * Both are created once, in fill_super(), and then held by the dcache - nothing here is built on
+ * demand (see sufs_make_ctl_inode() for the WARN that on-demand creation produced). */
 #define SUFS_ROOT_INO		1
 #define SUFS_CTL_INO		2
 
@@ -188,33 +188,35 @@ static const struct file_operations sufs_ctl_fops = {
 #endif
 };
 
-/* The node exists only under its own name; everything else is a negative dentry, i.e. the
- * filesystem answers about an unknown name the way any other filesystem does. */
+/* The one node, built ONCE by sufs_fill_super() and then held by the dcache under its own
+ * name.  It is deliberately NOT created on demand in ->lookup: the first version did that
+ * (iget_locked() + d_splice_alias()) and every unmount that had followed an open() reported
+ *   BUG: Dentry ...{i=2,n=control} still in use (-1) [unmount of sufs sufs]
+ *   VFS: Busy inodes after unmount of sufs. Self-destruct in 5 seconds.
+ * - the dentry/inode lifetime of a hand-rolled dynamic node is easy to get wrong, and this
+ * filesystem does not need one: its node set is fixed and known at mount time. */
+static struct inode *sufs_make_ctl_inode(struct super_block *sb)
+{
+	struct inode *inode = new_inode(sb);
+
+	if (!inode)
+		return NULL;
+	inode->i_ino = SUFS_CTL_INO;
+	inode->i_mode = S_IFREG | 0600;
+	inode->i_uid = GLOBAL_ROOT_UID;
+	inode->i_gid = GLOBAL_ROOT_GID;
+	inode->i_fop = &sufs_ctl_fops;
+	inode->i_size = 0;
+	sufs_set_times(inode);
+	return inode;
+}
+
+/* A lookup that gets here is a miss by definition - everything this filesystem has is already in
+ * the dcache (see sufs_fill_super()) - so the honest answer is a negative dentry.  The method
+ * itself must exist: the VFS refuses to call into a directory whose i_op has no ->lookup. */
 static struct dentry *sufs_lookup(struct inode *dir, struct dentry *dentry, unsigned int flags)
 {
-	static const char ctl[] = SUFS_CTL_NAME;
-	struct inode *inode;
-
-	if (dentry->d_name.len != sizeof(ctl) - 1 ||
-	    memcmp(dentry->d_name.name, ctl, sizeof(ctl) - 1))
-		return NULL;
-
-	/* iget_locked() is what keeps this to ONE inode for the node's whole life: without it every
-	 * lookup would allocate a fresh inode that stays in the cache (i_nlink != 0), i.e. the
-	 * module would leak a little memory per stat(). */
-	inode = iget_locked(dir->i_sb, SUFS_CTL_INO);
-	if (!inode)
-		return ERR_PTR(-ENOMEM);
-	if (inode->i_state & I_NEW) {
-		inode->i_mode = S_IFREG | 0600;
-		inode->i_uid = GLOBAL_ROOT_UID;
-		inode->i_gid = GLOBAL_ROOT_GID;
-		inode->i_fop = &sufs_ctl_fops;
-		inode->i_size = 0;
-		sufs_set_times(inode);
-		unlock_new_inode(inode);
-	}
-	return d_splice_alias(inode, dentry);
+	return NULL;
 }
 
 static const struct inode_operations sufs_dir_iops = {
@@ -231,7 +233,8 @@ static const struct super_operations sufs_sops = {
 
 static int sufs_fill_super(struct super_block *sb, struct fs_context *fc)
 {
-	struct inode *root;
+	struct inode *root, *ctl;
+	struct dentry *cd;
 
 	sb->s_magic = SUFS_MAGIC;
 	sb->s_op = &sufs_sops;
@@ -253,6 +256,19 @@ static int sufs_fill_super(struct super_block *sb, struct fs_context *fc)
 	sb->s_root = d_make_root(root);
 	if (!sb->s_root)
 		return -ENOMEM;
+
+	/* The node: inode and dentry both built here, the dentry bound into the dcache before anyone
+	 * can look for it.  d_add() consumes the inode reference, so the failure path is the only
+	 * place that has to iput(). */
+	ctl = sufs_make_ctl_inode(sb);
+	if (!ctl)
+		return -ENOMEM;
+	cd = d_alloc_name(sb->s_root, SUFS_CTL_NAME);
+	if (!cd) {
+		iput(ctl);
+		return -ENOMEM;
+	}
+	d_add(cd, ctl);
 	return 0;
 }
 
@@ -329,7 +345,14 @@ static __nocfi int sufs_do_umount(const char *mntpoint, int flags)
 	struct path path;
 	int rc;
 
-	rc = kern_path(mntpoint, LOOKUP_FOLLOW, &path);
+	/* LOOKUP_MOUNTPOINT, exactly like sys_umount(): without it the lookup walks INTO our own
+	 * mount, so the path we hand to path_umount() holds a reference to the very dentry the
+	 * unmount then checks - and the kernel says so:
+	 *   WARNING at fs/namespace.c:1193 (path_put)
+	 *   BUG: Dentry ...{i=0,n=/} still in use (-128) [unmount of sufs sufs]
+	 * With the flag, the lookup stops at the mountpoint itself (the dentry in the covering
+	 * filesystem) and nothing of ours is pinned. */
+	rc = kern_path(mntpoint, LOOKUP_FOLLOW | LOOKUP_MOUNTPOINT, &path);
 	if (rc)
 		return rc;
 	rc = sufs_path_umount_p(&path, flags);
