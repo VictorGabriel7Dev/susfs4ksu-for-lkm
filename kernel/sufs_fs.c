@@ -495,11 +495,7 @@ static struct dentry *sufs_lookup(struct inode *dir, struct dentry *dentry, unsi
  * reflects what happens to have been looked up before is a history, and two reads of the same
  * directory would not agree with each other.  "control" is always there, every table entry follows
  * in table order. */
-/* __nocfi, and the CI gate is what asked for it: dir_emit() invokes ctx->actor(), a KERNEL
- * function pointer, from inside this function, and a checked indirect call into the kernel panics
- * on these builds (the module's type hash for a kernel prototype is not the kernel's).  This is
- * the same rule every other indirect call in this module follows.  The kernel calling THIS
- * function back through file_operations->iterate_shared is the other direction and unaffected. */
+
 static const struct inode_operations sufs_dir_iops = {
 	.lookup = sufs_lookup,
 };
