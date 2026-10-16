@@ -5,6 +5,7 @@
  */
 #include <linux/module.h>
 #include <linux/kobject.h>	/* kobject_del(): the module's own /sys/module entry */
+#include <linux/slab.h>		/* kfree(): dropping the parameter attrs before that */
 #include <linux/kernel.h>
 #include <linux/init.h>
 #include <linux/version.h>	/* LINUX_VERSION_CODE: the MODULE_IMPORT_NS spelling below */
@@ -251,8 +252,29 @@ static int __init susfs_init(void)
      * mod_sysfs_teardown() calls kobject_del() again when the module is finally freed: that is
      * safe (kernfs_remove() on an already removed node is a no-op, kobject_put(NULL) is guarded),
      * which is what makes the one-liner usable instead of a leak. */
-    if (!susfs_keep_sysfs_dir)
+    if (!susfs_keep_sysfs_dir) {
+        /* free_module() runs module_param_sysfs_remove() BEFORE it deletes the kobject, and that
+         * helper goes through sysfs_remove_group(kobj, grp) -> kernfs_find_and_get_ns(kobj->sd,
+         * ...), which - unlike sysfs_remove_file() - does NOT check kobj->sd for NULL, while
+         * kobject_del() has just set it to NULL.  For a module that HAS parameters, rmmod then
+         * dies exactly here (measured, PJA110 / 5.15.180):
+         *   kernfs_find_and_get_ns+0x44 -> sysfs_remove_group -> module_param_sysfs_remove
+         *   -> free_module -> __se_sys_delete_module
+         *   Kernel panic - not syncing: Oops: Fatal exception
+         *
+         * KernelSU's one-liner is safe for KernelSU because its LKM declares no module
+         * parameters, so mkobj.mp stays NULL and that branch is never reached.  This module has
+         * several (expose_proc, privfs, fail_layer, ...), so the difference matters - it is the
+         * whole reason this comment exists.
+         *
+         * Dropping the attribute block first - the very kfree() module_param_free() would do; mp
+         * and its attrs[] are a single allocation - makes module_param_sysfs_remove() return
+         * immediately: no group is looked up, nothing is dereferenced, nothing is leaked.  The
+         * modinfo attributes need no such care: sysfs_remove_file() does check kobj->sd. */
+        kfree(THIS_MODULE->mkobj.mp);
+        THIS_MODULE->mkobj.mp = NULL;
         kobject_del(&THIS_MODULE->mkobj.kobj);
+    }
 
     return 0;
 }
