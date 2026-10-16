@@ -70,7 +70,11 @@ static char *sufs_mnt_point = SUFS_MNTPT_DEFAULT;
 module_param_named(privfs_mnt, sufs_mnt_point, charp, 0600);
 
 static bool sufs_is_registered;
+/* Only the >= 5.12 build can mount (see the path_mount note below), so the flag lives inside the
+ * same gate: an unreferenced variable is a build failure on the GKI trees (CONFIG_WERROR). */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
 static bool sufs_is_mounted;
+#endif
 
 bool sufs_fs_registered(void)
 {
@@ -363,6 +367,7 @@ int sufs_fs_init(void)
 
 void sufs_fs_exit(void)
 {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
 	if (sufs_is_mounted) {
 		int rc = sufs_do_umount(sufs_mnt_point);
 
@@ -377,6 +382,7 @@ void sufs_fs_exit(void)
 		}
 		sufs_is_mounted = false;
 	}
+#endif /* >= 5.12 */
 
 	if (sufs_is_registered) {
 		int rc = unregister_filesystem(&sufs_fs_type);
