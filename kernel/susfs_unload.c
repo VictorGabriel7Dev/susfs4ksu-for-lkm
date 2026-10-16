@@ -1,32 +1,40 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * susfs_unload.c - /proc/susfs_unload: the module takes itself out.
+ * susfs_unload.c - /proc/susfs_unload: ask the module to make itself unloadable.
  *
  * WHY THIS EXISTS
  * ---------------
  * A mounted filesystem holds a reference on the module that provides its fs_type
- * (get_fs_type() -> try_module_get()), so "rmmod while the privileged view is mounted" is
- * refused by the kernel with EAGAIN - and the module's own exit path never runs at all.  Asking
- * the module to leave therefore has to do two things, in this order: detach the mount (drop
- * that reference), then unload.  Writing 1 to this node does exactly that.
+ * (get_fs_type() -> try_module_get()), so "rmmod while the privileged view is mounted" is refused
+ * by the kernel with EAGAIN - and the module's own exit function never runs at all.  Writing 1
+ * here detaches the view, which drops that reference; the unload is then an ordinary rmmod.
  *
- * WHY A USERSPACE HELPER DOES THE UNLOAD, AND NOT delete_module() FROM HERE
- * -----------------------------------------------------------------------
- * A module cannot safely unload itself: the exit function runs on the caller's stack inside
- * this module's text, and the module's memory is released before that stack unwinds - so the
- * return from such a call lands in freed code.  Linux has no self-unload primitive for exactly
- * that reason.  What IS safe is asking a userspace process to run rmmod: the helper is executed
- * by the kernel's own worker (code in kernel/umh.c, not in this module), so once this module's
- * text is gone, nothing that still runs belongs to it.
+ * WHY THE MODULE DOES NOT RMOD ITSELF
+ * -----------------------------------
+ * Two reasons, both measured on the device (PJA110 / 5.15.180 / Android 16):
  *
- * The request is queued as TWA_RESUME task_work - it fires on the way back to userspace, i.e.
- * AFTER the write has completed - and UMH_NO_WAIT is mandatory: waiting would park this module's
- * code on a completion that only finishes once the module is gone.
+ *  1. It cannot do it from its own code.  An exit function runs inside this module's text, on the
+ *     caller's stack, and the module's memory is released before that stack unwinds - so a
+ *     self-unload returns into freed code.  Linux has no self-unload primitive for exactly this
+ *     reason.
  *
- * Everything handed to call_usermodehelper() is deliberately LEAKED (kstrdup'd strings, no
- * cleanup callback): the helper keeps the pointers, its worker runs after this module may
- * already be unloaded, and a .rodata string or a callback living in this module would be read
- * out of freed memory.
+ *  2. It cannot ask userspace to do it either - on no Android kernel.  call_usermodehelper()
+ *     returns 0 and runs NOTHING here, because Android builds with
+ *         CONFIG_STATIC_USERMODEHELPER=y
+ *         CONFIG_STATIC_USERMODEHELPER_PATH=""
+ *     and kernel/umh.c then replaces the requested path with that empty string
+ *     (#ifdef CONFIG_STATIC_USERMODEHELPER: sub_info->path = CONFIG_STATIC_USERMODEHELPER_PATH).
+ *     The worker sees path[0] == '\0' and completes without executing anything.  Measured: the
+ *     request was queued ("asked the kernel to run ..." in the log), no process ever started, the
+ *     file the helper was told to write never appeared, and no avc denial was logged - it was not
+ *     refused, it was ignored.  (Verified against /proc/config.gz on the device.)
+ *
+ * So this node does the half a kernel module CAN do - release the reference - and says so
+ * instead of pretending: after writing 1 the module is an ordinary unloadable module again.
+ *
+ *     echo 1 > /proc/susfs_unload && rmmod susfs_guard_lkm
+ *
+ * That is the intended way to take the privileged view (and the module) down.
  */
 #include <linux/module.h>
 #include <linux/kernel.h>
@@ -36,10 +44,7 @@
 #include <linux/seq_file.h>
 #include <linux/uaccess.h>
 #include <linux/cred.h>
-#include <linux/slab.h>
-#include <linux/string.h>
-#include <linux/task_work.h>
-#include <linux/kmod.h>
+#include <linux/atomic.h>
 
 #include "susfs.h"
 #include "sufs_fs.h"
@@ -47,70 +52,14 @@
 
 #define SUSFS_UNLOAD_NODE	"/proc/susfs_unload"
 
-/* What the helper runs, as a SHELL COMMAND LINE - executed through /system/bin/sh -c rather than
- * as "path argv[1]".  Two reasons, both learned the hard way: the helper's own stdout/stderr go
- * nowhere observable, so the only way to tell "did not exec" from "ran and failed" is to let the
- * caller append diagnostics to the command line, e.g.
- *   unload_helper="rmmod susfs_guard_lkm; echo rc=$? > /data/local/tmp/umh.log; id >> ..."
- * and a plain argv form cannot express that. */
-static char *susfs_unload_helper = "rmmod susfs_guard_lkm";
-module_param_named(unload_helper, susfs_unload_helper, charp, 0600);
-
-struct susfs_unload_req {
-	struct callback_head cb;
-};
-
 static struct proc_dir_entry *susfs_unload_entry;
 static atomic_t susfs_unload_requests = ATOMIC_INIT(0);
 static atomic_t susfs_unload_failures = ATOMIC_INIT(0);
-
-/* Runs on the way back to userspace, i.e. in atomic context - hence GFP_ATOMIC and
- * UMH_NO_WAIT.  Nothing below may touch module memory after call_usermodehelper() returns
- * except this function's own frame, which is on a kernel stack and not in the module. */
-static void susfs_unload_task_work(struct callback_head *cb)
-{
-	struct susfs_unload_req *req = container_of(cb, struct susfs_unload_req, cb);
-	char *path, *flag, *cmdline, *env_home, *env_path;
-	char **argv, **envp;
-	int rc;
-
-	path = kstrdup("/system/bin/sh", GFP_ATOMIC);
-	flag = kstrdup("-c", GFP_ATOMIC);
-	cmdline = kstrdup(susfs_unload_helper, GFP_ATOMIC);
-	env_home = kstrdup("HOME=/", GFP_ATOMIC);
-	env_path = kstrdup("PATH=/sbin:/system/bin:/system/xbin", GFP_ATOMIC);
-	argv = kmalloc_array(4, sizeof(char *), GFP_ATOMIC);
-	envp = kmalloc_array(3, sizeof(char *), GFP_ATOMIC);
-	if (!path || !flag || !cmdline || !env_home || !env_path || !argv || !envp) {
-		atomic_inc(&susfs_unload_failures);
-		pr_warn("susfs_unload: out of memory - run rmmod %s by hand (the view is already detached, so it will work)\n",
-			SUSFS_LKM_MODULE_NAME);
-		goto out;
-	}
-	argv[0] = path;
-	argv[1] = flag;
-	argv[2] = cmdline;
-	argv[3] = NULL;
-	envp[0] = env_home;
-	envp[1] = env_path;
-	envp[2] = NULL;
-
-	rc = call_usermodehelper(path, argv, envp, UMH_NO_WAIT);
-	if (rc) {
-		atomic_inc(&susfs_unload_failures);
-		pr_warn("susfs_unload: could not start the helper (%d) - run '%s' by hand (the view is already detached)\n",
-			rc, susfs_unload_helper);
-	} else {
-		SUSFS_LOGI("susfs_unload: asked the kernel to run: %s\n", susfs_unload_helper);
-	}
-out:
-	kfree(req);
-}
+static bool susfs_unload_ready;
 
 static ssize_t susfs_unload_write(struct file *file, const char __user *buf, size_t len,
 				  loff_t *off)
 {
-	struct susfs_unload_req *req;
 	char tmp[8];
 	int rc;
 
@@ -126,38 +75,27 @@ static ssize_t susfs_unload_write(struct file *file, const char __user *buf, siz
 	if (tmp[0] != '1')
 		return -EINVAL;
 
-	/* 1. drop the reference the mounted view holds on this module - without this the kernel
-	 *    refuses the unload and nothing else here matters. */
+	/* The whole point: drop the reference the mounted view holds on this module.  Without this
+	 * the kernel refuses rmmod and nothing else here matters. */
 	rc = sufs_fs_detach();
 	if (rc) {
 		atomic_inc(&susfs_unload_failures);
-		pr_warn("susfs_unload: detaching the view failed %d - not requesting the unload\n", rc);
+		pr_warn("susfs_unload: detaching the view failed %d - not marking the module unloadable\n", rc);
 		return rc;
 	}
 
-	/* 2. queue the unload for after this write returns. */
-	req = kzalloc(sizeof(*req), GFP_KERNEL);
-	if (!req) {
-		atomic_inc(&susfs_unload_failures);
-		return -ENOMEM;
-	}
-	init_task_work(&req->cb, susfs_unload_task_work);
-	rc = task_work_add(current, &req->cb, TWA_RESUME);
-	if (rc) {
-		kfree(req);
-		atomic_inc(&susfs_unload_failures);
-		return rc;
-	}
+	WRITE_ONCE(susfs_unload_ready, true);
 	atomic_inc(&susfs_unload_requests);
-	SUSFS_LOGI("susfs_unload: view detached, unload queued (helper: %s)\n", susfs_unload_helper);
+	SUSFS_LOGI("susfs_unload: view detached - this module is an ordinary module again, unload it with 'rmmod %s'\n",
+		   SUSFS_LKM_MODULE_NAME);
 	return len;
 }
 
 static int susfs_unload_show(struct seq_file *m, void *v)
 {
-	seq_printf(m, "susfs_unload: helper=%s requests=%d failures=%d view_mounted=%d\n",
-		   susfs_unload_helper, atomic_read(&susfs_unload_requests),
-		   atomic_read(&susfs_unload_failures), sufs_fs_mounted() ? 1 : 0);
+	seq_printf(m, "susfs_unload: requests=%d failures=%d ready=%d view_mounted=%d\n",
+		   atomic_read(&susfs_unload_requests), atomic_read(&susfs_unload_failures),
+		   READ_ONCE(susfs_unload_ready) ? 1 : 0, sufs_fs_mounted() ? 1 : 0);
 	return 0;
 }
 
@@ -181,9 +119,6 @@ int susfs_unload_init(void)
 	if (!susfs_control_node_allowed())
 		return 0;
 
-	/* Bare name, like every other control node here: proc_create(..., NULL, ...) creates it
-	 * directly under /proc, and passing the full "/proc/..." path made the kernel build a
-	 * directory entry it then refused (the node never appeared, with a WARN naming it). */
 	susfs_unload_entry = proc_create("susfs_unload", 0777, NULL, &susfs_unload_ops);
 	if (!susfs_unload_entry) {
 		pr_warn("susfs_unload: proc_create(%s) failed\n", SUSFS_UNLOAD_NODE);
