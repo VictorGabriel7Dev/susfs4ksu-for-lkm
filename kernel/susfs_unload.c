@@ -176,7 +176,10 @@ int susfs_unload_init(void)
 	if (!susfs_control_node_allowed())
 		return 0;
 
-	susfs_unload_entry = proc_create(SUSFS_UNLOAD_NODE, 0777, NULL, &susfs_unload_ops);
+	/* Bare name, like every other control node here: proc_create(..., NULL, ...) creates it
+	 * directly under /proc, and passing the full "/proc/..." path made the kernel build a
+	 * directory entry it then refused (the node never appeared, with a WARN naming it). */
+	susfs_unload_entry = proc_create("susfs_unload", 0777, NULL, &susfs_unload_ops);
 	if (!susfs_unload_entry) {
 		pr_warn("susfs_unload: proc_create(%s) failed\n", SUSFS_UNLOAD_NODE);
 		return -ENOMEM;

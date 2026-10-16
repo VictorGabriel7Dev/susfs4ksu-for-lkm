@@ -4,6 +4,7 @@
  * Loaded via `ksud insmod`, with unexported symbols relocated via kallsyms.
  */
 #include <linux/module.h>
+#include <linux/kobject.h>	/* kobject_del(): the module's own /sys/module entry */
 #include <linux/kernel.h>
 #include <linux/init.h>
 #include <linux/version.h>	/* LINUX_VERSION_CODE: the MODULE_IMPORT_NS spelling below */
@@ -147,6 +148,12 @@ static struct {
 static int fail_layer;
 module_param_named(fail_layer, fail_layer, int, 0644);
 
+/* Diagnostics: leave /sys/module/<name> in place (0 = the default, which removes it).  The same
+ * role KernelSU's CONFIG_KSU_DEBUG plays for its own kobject_del(): once the directory is gone a
+ * module parameter cannot be inspected after load, and this is how that is traded back. */
+static bool susfs_keep_sysfs_dir;
+module_param_named(sysfs_dir, susfs_keep_sysfs_dir, bool, 0600);
+
 /* Not __init/__exit: it is called from both, and an __exit callee in __init code is a
  * modpost section mismatch. */
 static void susfs_layers_down(int upto)
@@ -229,8 +236,23 @@ static int __init susfs_init(void)
      * operator greps for, so it stays unconditional even for a silent load - otherwise
      * "loaded but logging off" is indistinguishable from "not loaded".  The prefix comes
      * from pr_fmt (susfs_log.h), so the message must not repeat it. */
-    pr_info("loaded. This module is filtered out of /proc/modules for every caller including root, so `lsmod | grep susfs` stays empty - check /sys/module/%s instead (a second insmod fails with -EEXIST while it is loaded).\n",
+    pr_info("loaded. Nothing lists this module: /proc/modules is filtered for every caller including root, and /sys/module/%s is removed from sysfs altogether (sysfs_dir=1 keeps it for debugging). A second insmod fails with -EEXIST while it is loaded.\n",
             SUSFS_LKM_MODULE_NAME);
+
+    /* KernelSU's own trick - kernel/core/init.c, kobject_del(&THIS_MODULE->mkobj.kobj), under
+     * #ifdef MODULE / #ifndef CONFIG_KSU_DEBUG - and it is deliberately the LAST thing here, the
+     * same way: load_module() created /sys/module/<name> before this function ever ran, and
+     * removing it is only safe to hide behind "everything came up".
+     *
+     * It is also the one hiding mechanism in this module that forges nothing: the directory is
+     * really gone, so every caller - root included - gets ENOENT from the kernel rather than an
+     * answer we made up.  Nothing else in this project has that property.
+     *
+     * mod_sysfs_teardown() calls kobject_del() again when the module is finally freed: that is
+     * safe (kernfs_remove() on an already removed node is a no-op, kobject_put(NULL) is guarded),
+     * which is what makes the one-liner usable instead of a leak. */
+    if (!susfs_keep_sysfs_dir)
+        kobject_del(&THIS_MODULE->mkobj.kobj);
 
     return 0;
 }
