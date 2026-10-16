@@ -324,7 +324,7 @@ static __nocfi int sufs_do_mount(const char *mntpoint)
 	return rc;
 }
 
-static __nocfi int sufs_do_umount(const char *mntpoint)
+static __nocfi int sufs_do_umount(const char *mntpoint, int flags)
 {
 	struct path path;
 	int rc;
@@ -332,7 +332,7 @@ static __nocfi int sufs_do_umount(const char *mntpoint)
 	rc = kern_path(mntpoint, LOOKUP_FOLLOW, &path);
 	if (rc)
 		return rc;
-	rc = sufs_path_umount_p(&path, 0);
+	rc = sufs_path_umount_p(&path, flags);
 	path_put(&path);
 	return rc;
 }
@@ -399,17 +399,36 @@ void sufs_fs_exit(void)
 {
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
 	if (sufs_is_mounted) {
-		int rc = sufs_do_umount(sufs_mnt_point);
+		int rc = sufs_do_umount(sufs_mnt_point, 0);
 
+		/* -EINVAL/-ENOENT means the path is not (or no longer) OUR mount, i.e. someone
+		 * unmounted it from userspace first.  From here that is a SUCCESS: there is nothing
+		 * left to detach.
+		 *
+		 * This branch is not cosmetic.  Measured on the device (PJA110, 5.15.180): without it
+		 * a userspace umount made the old "umount failed -> hold the module back" path return
+		 * early, unregister_filesystem() never ran, the module was freed anyway (an exit
+		 * function runs after delete_module()'s refcount check, so __module_get() there is far
+		 * too late to stop the unload), and the global file_systems list kept pointing at
+		 * freed memory.  The next reader of that list died:
+		 *   filesystems_proc_show+0x50/0xa0 -> seq_read_iter -> __arm64_sys_read
+		 *   Kernel panic - not syncing: Oops: Fatal exception
+		 * i.e. a plain 'cat /proc/filesystems'.  Never let this path return without running
+		 * unregister_filesystem(). */
+		if (rc == -EINVAL || rc == -ENOENT)
+			rc = 0;
+
+		/* Still attached (something holds it): a lazy detach is the strongest thing available
+		 * from here, and an open file cannot refuse it. */
 		if (rc) {
-			/* A registered filesystem that is still MOUNTED when this module's memory goes
-			 * away is the dangerous order; hold a reference on ourselves so rmmod fails with
-			 * EBUSY instead. */
-			pr_err("sufs_fs: umount %s failed %d - refusing to let this module unload\n",
-			       sufs_mnt_point, rc);
-			__module_get(THIS_MODULE);
-			return;
+			rc = sufs_do_umount(sufs_mnt_point, MNT_DETACH);
+			if (rc == -EINVAL || rc == -ENOENT)
+				rc = 0;
 		}
+		if (rc)
+			pr_err("sufs_fs: could not detach %s (%d) - unregistering anyway\n",
+			       sufs_mnt_point, rc);
+
 		sufs_is_mounted = false;
 	}
 #endif /* >= 5.12 */
@@ -417,12 +436,17 @@ void sufs_fs_exit(void)
 	if (sufs_is_registered) {
 		int rc = unregister_filesystem(&sufs_fs_type);
 
+		/* NEVER skipped, and never a reason to hold the module back.  This one call decides
+		 * whether the global file_systems list still points at this module's memory after the
+		 * module is gone - and since exit runs after the kernel has already decided to unload
+		 * us, there is no way to refuse from here (see the note above).  So: always try, and
+		 * say loudly what state the list is left in if it fails. */
 		if (rc) {
-			pr_err("sufs_fs: unregister_filesystem failed %d - keeping the module alive\n", rc);
-			__module_get(THIS_MODULE);
-			return;
+			pr_err("sufs_fs: unregister_filesystem failed %d - the file_systems list still references this module\n",
+			       rc);
+		} else {
+			sufs_is_registered = false;
+			SUSFS_LOGI("sufs_fs: unregistered\n");
 		}
-		sufs_is_registered = false;
-		SUSFS_LOGI("sufs_fs: unregistered\n");
 	}
 }
