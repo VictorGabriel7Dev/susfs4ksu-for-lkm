@@ -634,6 +634,8 @@ static int sufs_init_fs_context(struct fs_context *fc)
 	return 0;
 }
 
+static void sufs_release_views(void);
+
 /* kill_sb() is the last hook we get before the kernel tears the superblock down, and it runs
  * BEFORE kill_litter_super()'s d_genocide()/shrink_dcache_for_umount() - which is the whole point:
  * the view's dentry references have to be gone by then, or the tree walk reports every name. */
