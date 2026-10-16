@@ -118,12 +118,6 @@ struct sufs_view_entry {
 	char name[SUFS_VIEW_NAME_MAX];
 	char real[SUSFS_OR_PATH_MAX];
 	unsigned long ino;	/* this name's own inode number; 0 = free slot */
-	/* The dentry built for this name, with a reference of OUR own (d_alloc_name()'s one went to
-	 * the dcache with d_add()).  Keeping the pointer is what makes unexpose reliable: looking the
-	 * dentry up by name at that point was measured to find nothing (the listing still showed the
-	 * name, and the log said "no dentry to remove"), and without the dentry there is no way to
-	 * take the name out of the listing. */
-	struct dentry *dentry;
 };
 
 static struct sufs_view_entry sufs_views[SUFS_VIEW_MAX];
@@ -425,14 +419,29 @@ static int sufs_view_expose(char *args)
 			return -ENOMEM;
 		}
 		d_add(d, inode);
-		dget(d);	/* our own reference; released by unexpose or put_super() */
+		/* Hand back the reference d_alloc_name() gave us: d_add() does not consume it (fs/dcache.c
+		 * says so outright - "The entry was actually filled in earlier during d_alloc()").  A
+		 * dentry that still has a reference when the superblock is torn down is exactly what
+		 * shrink_dcache_parent() will NOT collect (it takes only d_lockref.count == 0), which is
+		 * what produced
+		 *   BUG: Dentry ...{i=4,n=second} still in use (1) [unmount of sufs sufs]
+		 * once per exposed name - measured, with the reference held.  At count 0 the dentry stays
+		 * in the dcache (the hash and the parent chain are what make it visible to a listing), so
+		 * the name is still listed and still findable by d_lookup() - it is just collectable. */
+		dput(d);
+		d = NULL;
 	}
 
 	rc = susfs_open_redirect_add_view_rule(view, real);
 	if (rc) {
-		if (d) {
-			d_drop(d);
-			dput(d);
+		if (sufs_view_root) {
+			struct qstr q = QSTR_INIT(name, strlen(name));
+			struct dentry *victim = d_lookup(sufs_view_root, &q);
+
+			if (victim) {
+				d_drop(victim);
+				dput(victim);
+			}
 		}
 		pr_warn("sufs_fs: expose %s -> %s failed %d\n", view, real, rc);
 		return rc;
@@ -444,7 +453,6 @@ static int sufs_view_expose(char *args)
 		strscpy(e->name, name, sizeof(e->name));
 		strscpy(e->real, real, sizeof(e->real));
 		e->ino = ino;
-		e->dentry = d;
 	}
 	mutex_unlock(&sufs_views_lock);
 
@@ -478,7 +486,6 @@ static int sufs_view_unexpose(char *args)
 		mutex_unlock(&sufs_views_lock);
 		return -ENOENT;
 	}
-	d = sufs_views[i].dentry;
 	memmove(&sufs_views[i], &sufs_views[i + 1],
 		(size_t)(sufs_nviews - i - 1) * sizeof(sufs_views[0]));
 	sufs_nviews--;	/* the entry's ino goes back to the pool with it */
@@ -487,12 +494,17 @@ static int sufs_view_unexpose(char *args)
 	susfs_open_redirect_del_view_rule(view);
 
 	/* Take the name out of the listing: the listing IS the dcache (see sufs_view_expose), and
-	 * dcache_readdir skips dentries that are no longer hashed.  d_drop() plus giving back the
-	 * reference we kept is enough; a later lookup for the name finds no dcache entry, asks the
-	 * table, gets "not there", and hands out a negative dentry. */
-	if (d) {
-		d_drop(d);
-		dput(d);
+	 * dcache_readdir skips dentries that are no longer hashed.  d_lookup() is enough because the
+	 * dentry - when it still exists - sits in the dcache at count 0; if it was already reclaimed
+	 * the name is not listed any more either, which is the same outcome. */
+	if (sufs_view_root) {
+		struct qstr q = QSTR_INIT(name, strlen(name));
+		struct dentry *victim = d_lookup(sufs_view_root, &q);
+
+		if (victim) {
+			d_drop(victim);
+			dput(victim);
+		}
 	}
 	SUSFS_LOGI("sufs_fs: unexposed %s (view now holds %d name(s))\n", name, sufs_nviews);
 	return 0;
@@ -560,6 +572,8 @@ static void sufs_put_super(struct super_block *sb)
 	 * d_add().  The placeholder inode needs no such care: iget_locked() gave it a normal
 	 * dcache-owned life. */
 	sufs_view_root = NULL;
+	/* The table is empty by now: nothing here holds a dentry or an inode reference any more. */
+	sufs_nviews = 0;
 	if (sufs_ctl_inode) {
 		iput(sufs_ctl_inode);
 		sufs_ctl_inode = NULL;
@@ -634,23 +648,11 @@ static int sufs_init_fs_context(struct fs_context *fc)
 	return 0;
 }
 
-static void sufs_release_views(void);
-
-/* kill_sb() is the last hook we get before the kernel tears the superblock down, and it runs
- * BEFORE kill_litter_super()'s d_genocide()/shrink_dcache_for_umount() - which is the whole point:
- * the view's dentry references have to be gone by then, or the tree walk reports every name. */
-static void sufs_kill_sb(struct super_block *sb)
-{
-	SUSFS_LOGI("sufs_fs: kill_sb: releasing %d view name(s) before the teardown\n", sufs_nviews);
-	sufs_release_views();
-	kill_litter_super(sb);
-}
-
 static struct file_system_type sufs_fs_type = {
 	.owner = THIS_MODULE,
 	.name = SUFS_FS_NAME,
 	.init_fs_context = sufs_init_fs_context,
-	.kill_sb = sufs_kill_sb,
+	.kill_sb = kill_litter_super,
 };
 
 /* ---- mounting it ourselves ---------------------------------------------------------------
@@ -776,31 +778,6 @@ int sufs_fs_detach(void)
 #else
 	return 0;
 #endif
-}
-
-/* Give back every dentry reference the table holds.  Called from sufs_kill_sb(), i.e. BEFORE
- * kill_litter_super() shrinks the tree and before shrink_dcache_for_umount() walks it: that walk
- * tolerates a root dentry with one reference and nothing else, so a child dentry still held by us
- * at that point is reported as
- *   BUG: Dentry ...{i=4,n=second} still in use (1) [unmount of sufs sufs]
- * (measured: that is exactly what the first version of this table produced, one line per name).
- * Releases them here, and the reference the dcache owns is free to be collected as usual. */
-static void sufs_release_views(void)
-{
-	int i;
-
-	mutex_lock(&sufs_views_lock);
-	for (i = 0; i < sufs_nviews; i++) {
-		if (sufs_views[i].dentry) {
-			SUSFS_LOGI("sufs_fs: releasing dentry %s (inode %lu)\n",
-				   sufs_views[i].name, sufs_views[i].ino);
-			d_drop(sufs_views[i].dentry);
-			dput(sufs_views[i].dentry);
-			sufs_views[i].dentry = NULL;
-		}
-	}
-	sufs_nviews = 0;
-	mutex_unlock(&sufs_views_lock);
 }
 
 /* ---- the host check ----------------------------------------------------------------------
