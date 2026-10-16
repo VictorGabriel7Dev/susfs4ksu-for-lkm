@@ -333,6 +333,10 @@ static struct inode *sufs_view_inode(struct super_block *sb)
  * evicted from the dcache gets handed back (see sufs_lookup below).  Released in put_super(). */
 static struct inode *sufs_ctl_inode;
 
+/* sb->s_root, kept for the dentry work the commands do (see sufs_view_expose): the view's listing
+ * is the dcache itself, so adding and removing a name means adding and removing a dentry here. */
+static struct dentry *sufs_view_root;
+
 /* expose <view-name> <real-path> - the whole command surface for now.  Small on purpose: the shape
  * of the view is still being settled, and a command that is not here cannot be misused. */
 static int sufs_view_expose(char *args)
@@ -397,6 +401,25 @@ static int sufs_view_expose(char *args)
 	mutex_unlock(&sufs_views_lock);
 
 	SUSFS_LOGI("sufs_fs: exposed %s at %s (view now holds %d name(s))\n", real, view, sufs_nviews);
+
+	/* The listing IS the dcache: the root uses simple_dir_operations (dcache_readdir), so a name
+	 * shows up in "ls" exactly while it has a dentry here.  Building the dentry by hand instead of
+	 * emitting the entry ourselves is deliberate - dir_emit() invokes the kernel's actor pointer,
+	 * an indirect call into the kernel, and on these builds __nocfi did not keep the CFI check out
+	 * of that function (measured: the CFI call-site gate kept finding the relocation, and a checked
+	 * call there panics at run time).  Handing the emitting to the kernel removes the question. */
+	if (sufs_view_root) {
+		struct inode *inode = sufs_view_inode(sufs_view_root->d_sb);
+
+		if (!IS_ERR(inode)) {
+			struct dentry *d = d_alloc_name(sufs_view_root, name);
+
+			if (d)
+				d_add(d, inode);	/* consumes the reference */
+			else
+				iput(inode);
+		}
+	}
 	return 0;
 }
 
@@ -430,6 +453,17 @@ static int sufs_view_unexpose(char *args)
 	mutex_unlock(&sufs_views_lock);
 
 	susfs_open_redirect_del_view_rule(view);
+
+	/* Take the dentry out of the dcache, which is what removes the name from the listing. */
+	if (sufs_view_root) {
+		struct qstr q = QSTR_INIT(name, strlen(name));
+		struct dentry *d = d_lookup(sufs_view_root, &q);
+
+		if (d) {
+			d_drop(d);
+			dput(d);
+		}
+	}
 	SUSFS_LOGI("sufs_fs: unexposed %s (view now holds %d name(s))\n", name, sufs_nviews);
 	return 0;
 }
@@ -466,52 +500,6 @@ static struct dentry *sufs_lookup(struct inode *dir, struct dentry *dentry, unsi
  * on these builds (the module's type hash for a kernel prototype is not the kernel's).  This is
  * the same rule every other indirect call in this module follows.  The kernel calling THIS
  * function back through file_operations->iterate_shared is the other direction and unaffected. */
-/* dir_emit() calls ctx->actor(), a kernel function pointer, and the enclosing function therefore
- * has to be __nocfi - the same attribute every other indirect call into the kernel in this module
- * sits behind.  noinline is deliberate: LTO is otherwise free to inline this into its caller and
- * re-instrument the call there (the build workflow's own note records that failure mode). */
-static __nocfi noinline int sufs_emit(struct dir_context *ctx, const char *name, int len,
-				      unsigned long ino)
-{
-	return dir_emit(ctx, name, len, ino, DT_REG);
-}
-
-static __nocfi int sufs_dir_iterate(struct file *file, struct dir_context *ctx)
-{
-	if (!dir_emit_dots(file, ctx))
-		return 0;
-
-	if (ctx->pos == 2) {
-		if (!sufs_emit(ctx, SUFS_CTL_NAME, sizeof(SUFS_CTL_NAME) - 1, SUFS_CTL_INO))
-			return 0;
-		ctx->pos = 3;
-	}
-
-	for (;;) {
-		char name[SUFS_VIEW_NAME_MAX];
-		int i = (int)ctx->pos - 3;
-
-		mutex_lock(&sufs_views_lock);
-		if (i < 0 || i >= sufs_nviews) {
-			mutex_unlock(&sufs_views_lock);
-			break;
-		}
-		strscpy(name, sufs_views[i].name, sizeof(name));
-		mutex_unlock(&sufs_views_lock);
-
-		ctx->pos++;
-		if (!sufs_emit(ctx, name, strlen(name), SUFS_VIEW_INO))
-			return 0;
-	}
-	return 0;
-}
-
-static const struct file_operations sufs_dir_fops = {
-	.owner = THIS_MODULE,
-	.iterate_shared = sufs_dir_iterate,
-	.llseek = generic_file_llseek,
-};
-
 static const struct inode_operations sufs_dir_iops = {
 	.lookup = sufs_lookup,
 };
@@ -525,6 +513,7 @@ static void sufs_put_super(struct super_block *sb)
 	/* The one reference fill_super() took for ->lookup; the dcache's own reference left with
 	 * d_add().  The placeholder inode needs no such care: iget_locked() gave it a normal
 	 * dcache-owned life. */
+	sufs_view_root = NULL;
 	if (sufs_ctl_inode) {
 		iput(sufs_ctl_inode);
 		sufs_ctl_inode = NULL;
@@ -553,7 +542,7 @@ static int sufs_fill_super(struct super_block *sb, struct fs_context *fc)
 	root->i_uid = GLOBAL_ROOT_UID;
 	root->i_gid = GLOBAL_ROOT_GID;
 	root->i_op = &sufs_dir_iops;
-	root->i_fop = &sufs_dir_fops;
+	root->i_fop = &simple_dir_operations;
 	set_nlink(root, 2);
 	sufs_set_times(root);
 
@@ -577,6 +566,7 @@ static int sufs_fill_super(struct super_block *sb, struct fs_context *fc)
 	 * exactly one reference in this filesystem's hands, released by put_super(). */
 	sufs_ctl_inode = igrab(ctl);
 	d_add(cd, ctl);
+	sufs_view_root = sb->s_root;
 	return 0;
 }
 
