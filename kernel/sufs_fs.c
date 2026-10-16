@@ -190,7 +190,10 @@ static ssize_t sufs_ctl_read(struct file *file, char __user *buf, size_t len, lo
 	return simple_read_from_buffer(buf, len, ppos, tmp, n);
 }
 
+/* Forward declarations for the commands: sufs_ctl_write() dispatches to both, and both are
+ * defined further down with the view machinery they belong to. */
 static int sufs_view_expose(char *args);
+static int sufs_view_unexpose(char *args);
 
 static ssize_t sufs_ctl_write(struct file *file, const char __user *buf, size_t len,
 			      loff_t *ppos)
