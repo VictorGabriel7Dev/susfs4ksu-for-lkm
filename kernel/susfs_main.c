@@ -15,6 +15,7 @@
 #include "lsm_hook.h"
 #include "susfs.h"
 #include "susfs_opath.h"	/* SUSFS_OPATH_NODE + the layer's init/exit */
+#include "sufs_fs.h"		/* the privileged view's own filesystem (privfs) */
 
 /* The module's own name lives in susfs.h (SUSFS_LKM_MODULE_NAME / SUSFS_LKM_SYSFS_DIR):
  * /sys/module's directory and the rules that hide it (susfs_hide_syms.c) must agree, and the
@@ -119,6 +120,11 @@ static struct {
     { "kstat",		susfs_kstat_init,		susfs_kstat_exit,	false, false },
     { "sus_map",	susfs_sus_map_init,		susfs_sus_map_exit,	false, false },
     { "sus_mount",	susfs_sus_mount_init,		susfs_sus_mount_exit,	false, false },
+    /* After sus_mount, because it asks that layer to hide the mount it is about to create
+     * (sus_mount_privfs_arm) - arming this first would create a mount nothing has agreed to
+     * hide yet.  NOT fatal, and a no-op without privfs=1: the privileged view is an addition,
+     * never a condition for the module to work. */
+    { "sufs_fs",	sufs_fs_init,			sufs_fs_exit,		false, false },
     { "cmdline",	susfs_spoof_cmdline_init,	susfs_spoof_cmdline_exit, false, false },
     { "open_redirect",	susfs_open_redirect_init,	susfs_open_redirect_exit, false, false },
     { "enable_log",	susfs_enable_log_init,		susfs_enable_log_exit,	false, false },

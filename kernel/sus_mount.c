@@ -2718,3 +2718,43 @@ out:
                      &info.err, sizeof(info.err)))
         pr_warn("sus_mount supercall copy_to_user failed\n");
 }
+
+/* ---- the sufs (privileged-view filesystem) entry point -------------------------------------
+ * sufs_fs.c calls this - and only while its own privfs switch is on - to make the MOUNT IT IS
+ * ABOUT TO CREATE invisible to every non-su caller before that mount exists.  Two steps, in
+ * this order: the mountpoint joins the prefix list (so both the enable-time scan and the
+ * mount-time kr_newmnt hook accept it), and the three show probes are registered.
+ *
+ * Kept here rather than letting sufs_fs.c reach into this file's static helpers: the prefix
+ * grammar and the registration order are this layer's business, and sufs_fs only has to say
+ * "this path is mine".  Deliberately NOT wired into the default path: without privfs=1 nothing
+ * calls it, so upstream's "the user enables sus_mount explicitly through the supercall"
+ * behaviour is exactly what a default load still gets. */
+int sus_mount_privfs_arm(const char *mntpoint)
+{
+    char cmd[SUS_MOUNT_KEEP_LEN + 8];
+    int rc;
+
+    if (!mntpoint || mntpoint[0] != '/')
+        return -EINVAL;
+    if (strlen(mntpoint) >= SUS_MOUNT_KEEP_LEN)
+        return -ENAMETOOLONG;
+    if (strchr(mntpoint, ' ') || strchr(mntpoint, '\t') || strchr(mntpoint, '\n'))
+        return -EINVAL;   /* the prefix list is whitespace-separated on the write path */
+
+    scnprintf(cmd, sizeof(cmd), "add %s", mntpoint);
+    rc = sus_mount_keep_command(cmd, false);
+    if (rc) {
+        pr_warn("sus_mount: privfs: adding prefix %s failed %d\n", mntpoint, rc);
+        return rc;
+    }
+    rc = sus_mount_register();
+    if (rc) {
+        pr_warn("sus_mount: privfs: register failed %d\n", rc);
+        return rc;
+    }
+    SUSFS_LOGI("sus_mount: privfs armed - %s (and anything under it) is hidden from non-su callers\n",
+            mntpoint);
+    return 0;
+}
+

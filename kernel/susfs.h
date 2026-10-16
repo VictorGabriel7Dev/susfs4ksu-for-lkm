@@ -216,4 +216,14 @@ static inline bool susfs_open_redirect_active(void)
 int susfs_or_entry_init(void);
 void susfs_or_entry_exit(void);
 
+/* sus_mount's entry point for the sufs privileged view (kernel/sufs_fs.c): add @mntpoint to the
+ * hidden-prefix list and register the three mount-table hooks, so a mount this module creates for
+ * itself is invisible to every non-su caller.  Only called while sufs_fs's privfs switch is on. */
+int sus_mount_privfs_arm(const char *mntpoint);
+
+/* The privileged view's own layer (kernel/sufs_fs.c).  A no-op unless privfs=1: it then registers
+ * the "sufs" filesystem, asks sus_mount to hide it, and mounts it at privfs_mnt. */
+int sufs_fs_init(void);
+void sufs_fs_exit(void);
+
 #endif
