@@ -560,21 +560,6 @@ static void sufs_put_super(struct super_block *sb)
 	 * d_add().  The placeholder inode needs no such care: iget_locked() gave it a normal
 	 * dcache-owned life. */
 	sufs_view_root = NULL;
-	{
-		int i;
-
-		/* Any dentry the table still holds: drop it and give the reference back. */
-		mutex_lock(&sufs_views_lock);
-		for (i = 0; i < sufs_nviews; i++) {
-			if (sufs_views[i].dentry) {
-				d_drop(sufs_views[i].dentry);
-				dput(sufs_views[i].dentry);
-				sufs_views[i].dentry = NULL;
-			}
-		}
-		sufs_nviews = 0;
-		mutex_unlock(&sufs_views_lock);
-	}
 	if (sufs_ctl_inode) {
 		iput(sufs_ctl_inode);
 		sufs_ctl_inode = NULL;
@@ -649,11 +634,20 @@ static int sufs_init_fs_context(struct fs_context *fc)
 	return 0;
 }
 
+/* kill_sb() is the last hook we get before the kernel tears the superblock down, and it runs
+ * BEFORE kill_litter_super()'s d_genocide()/shrink_dcache_for_umount() - which is the whole point:
+ * the view's dentry references have to be gone by then, or the tree walk reports every name. */
+static void sufs_kill_sb(struct super_block *sb)
+{
+	sufs_release_views();
+	kill_litter_super(sb);
+}
+
 static struct file_system_type sufs_fs_type = {
 	.owner = THIS_MODULE,
 	.name = SUFS_FS_NAME,
 	.init_fs_context = sufs_init_fs_context,
-	.kill_sb = kill_litter_super,
+	.kill_sb = sufs_kill_sb,
 };
 
 /* ---- mounting it ourselves ---------------------------------------------------------------
@@ -773,6 +767,29 @@ int sufs_fs_detach(void)
 #else
 	return 0;
 #endif
+}
+
+/* Give back every dentry reference the table holds.  Called from sufs_kill_sb(), i.e. BEFORE
+ * kill_litter_super() shrinks the tree and before shrink_dcache_for_umount() walks it: that walk
+ * tolerates a root dentry with one reference and nothing else, so a child dentry still held by us
+ * at that point is reported as
+ *   BUG: Dentry ...{i=4,n=second} still in use (1) [unmount of sufs sufs]
+ * (measured: that is exactly what the first version of this table produced, one line per name).
+ * Releases them here, and the reference the dcache owns is free to be collected as usual. */
+static void sufs_release_views(void)
+{
+	int i;
+
+	mutex_lock(&sufs_views_lock);
+	for (i = 0; i < sufs_nviews; i++) {
+		if (sufs_views[i].dentry) {
+			d_drop(sufs_views[i].dentry);
+			dput(sufs_views[i].dentry);
+			sufs_views[i].dentry = NULL;
+		}
+	}
+	sufs_nviews = 0;
+	mutex_unlock(&sufs_views_lock);
 }
 
 /* ---- the host check ----------------------------------------------------------------------
