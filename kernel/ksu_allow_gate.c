@@ -58,16 +58,14 @@ int susfs_ksu_allow_gate_init(void)
 		susfs_ksu_allow_gate_off = true;
 		/* pr_warn, not SUSFS_LOGI: "the allowlist predicate is not in effect on this device"
 		 * is something an operator has to be able to see from the load alone. */
-		pr_warn("susfs_guard_lkm: neither %s nor %s is in kallsyms - the privileged-view predicate falls back to uid == 0, so a su-granted app and the manager app are NOT covered here.
-",
+		pr_warn("susfs_guard_lkm: neither %s nor %s is in kallsyms - the privileged-view predicate falls back to uid == 0, so a su-granted app and the manager app are NOT covered here.\n",
 			ksu_allow_symbols[0], ksu_allow_symbols[1]);
 		return 0;
 	}
 
 	ksu_allow_fn = (bool (*)(uid_t))addr;
 	susfs_ksu_allow_gate_off = false;	/* only now is there something to ask */
-	SUSFS_LOGI("ksu_allow_gate: resolved %s at %px - the privileged-view predicate now answers KernelSU
-",
+	SUSFS_LOGI("ksu_allow_gate: resolved %s at %px - the privileged-view predicate now answers KernelSU\n",
 		   used, (void *)addr);
 	return 0;
 }
