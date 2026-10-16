@@ -345,18 +345,22 @@ static __nocfi int sufs_do_umount(const char *mntpoint, int flags)
 	struct path path;
 	int rc;
 
-	/* LOOKUP_MOUNTPOINT, exactly like sys_umount(): without it the lookup walks INTO our own
-	 * mount, so the path we hand to path_umount() holds a reference to the very dentry the
-	 * unmount then checks - and the kernel says so:
-	 *   WARNING at fs/namespace.c:1193 (path_put)
-	 *   BUG: Dentry ...{i=0,n=/} still in use (-128) [unmount of sufs sufs]
-	 * With the flag, the lookup stops at the mountpoint itself (the dentry in the covering
-	 * filesystem) and nothing of ours is pinned. */
+	/* ksys_umount()'s own lookup flags (fs/namespace.c): the mountpoint itself, as seen from the
+	 * covering filesystem. */
 	rc = kern_path(mntpoint, LOOKUP_FOLLOW | LOOKUP_MOUNTPOINT, &path);
 	if (rc)
 		return rc;
+	/* NO path_put() here, and that is not an oversight: path_umount() consumes the path itself.
+	 *   fs/namespace.c (identical in 5.15 and 6.6):
+	 *     // we mustn't call path_put() as that would clear mnt_expiry_mark
+	 *     dput(path->dentry);
+	 *     mntput_no_expire(mnt);
+	 * Putting it a second time released the root dentry twice, which is what the kernel then
+	 * reported on the device:
+	 *     BUG: Dentry ...{i=0,n=/} still in use (-128) [unmount of sufs sufs]
+	 *     WARNING at fs/namespace.c:1193
+	 * The path is handed over and forgotten. */
 	rc = sufs_path_umount_p(&path, flags);
-	path_put(&path);
 	return rc;
 }
 #endif /* >= 5.12 */
