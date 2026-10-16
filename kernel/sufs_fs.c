@@ -641,6 +641,7 @@ static void sufs_release_views(void);
  * the view's dentry references have to be gone by then, or the tree walk reports every name. */
 static void sufs_kill_sb(struct super_block *sb)
 {
+	SUSFS_LOGI("sufs_fs: kill_sb: releasing %d view name(s) before the teardown\n", sufs_nviews);
 	sufs_release_views();
 	kill_litter_super(sb);
 }
@@ -791,6 +792,8 @@ static void sufs_release_views(void)
 	mutex_lock(&sufs_views_lock);
 	for (i = 0; i < sufs_nviews; i++) {
 		if (sufs_views[i].dentry) {
+			SUSFS_LOGI("sufs_fs: releasing dentry %s (inode %lu)\n",
+				   sufs_views[i].name, sufs_views[i].ino);
 			d_drop(sufs_views[i].dentry);
 			dput(sufs_views[i].dentry);
 			sufs_views[i].dentry = NULL;
