@@ -43,6 +43,7 @@
 #include <linux/string.h>
 #include <linux/uaccess.h>
 #include <linux/cred.h>
+#include <linux/uidgid.h>	/* uid_eq(), for the host check */
 #include <linux/mutex.h>
 #include <linux/atomic.h>
 #include <linux/statfs.h>
@@ -135,12 +136,22 @@ static ssize_t sufs_ctl_read(struct file *file, char __user *buf, size_t len, lo
 	int n;
 
 	mutex_lock(&sufs_ctl_lock);
+	mutex_lock(&sufs_views_lock);
 	n = scnprintf(tmp, sizeof(tmp),
-		      "sufs: node=%s privfs=%d reads=%d writes=%d denied=%d last=\"%s\"\n",
-		      SUFS_CTL_NAME, sufs_privfs ? 1 : 0,
+		      "sufs: node=%s privfs=%d views=%d reads=%d writes=%d denied=%d last=\"%s\"\n",
+		      SUFS_CTL_NAME, sufs_privfs ? 1 : 0, sufs_nviews,
 		      atomic_read(&sufs_ctl_reads), atomic_read(&sufs_ctl_writes),
 		      atomic_read(&sufs_ctl_denied),
 		      sufs_ctl_last_len ? sufs_ctl_last : "(none)");
+	{
+		int i;
+
+		for (i = 0; i < sufs_nviews && n < (int)sizeof(tmp) - 96; i++)
+			n += scnprintf(tmp + n, sizeof(tmp) - n, "sufs: view %s -> %s (rule=%d)\n",
+				       sufs_views[i].name, sufs_views[i].real,
+				       sufs_views[i].rule_live ? 1 : 0);
+	}
+	mutex_unlock(&sufs_views_lock);
 	mutex_unlock(&sufs_ctl_lock);
 
 	atomic_inc(&sufs_ctl_reads);
@@ -280,6 +291,38 @@ static struct inode *sufs_view_inode(struct super_block *sb)
  * evicted from the dcache gets handed back (see sufs_lookup below).  Released in put_super(). */
 static struct inode *sufs_ctl_inode;
 
+/* ---- the view name table: the single source of truth --------------------------------------
+ * "What is in the view" used to be recoverable only from two histories - the dcache (whatever had
+ * happened to be looked up) and open_redirect's own rule table.  This is the state instead: one
+ * entry per exposed name, written by the commands, and read by the status line, by lookup (to
+ * decide whether a name exists at all) and - once the directory listing lands - by readdir.
+ *
+ * SUFS_VIEW_MAX is this layer's own bound; open_redirect has its own slot limit below it, and an
+ * expose that cannot get a rule fails here rather than being recorded and silently inert. */
+#define SUFS_VIEW_MAX		16
+#define SUFS_VIEW_NAME_MAX	64
+
+struct sufs_view_entry {
+	char name[SUFS_VIEW_NAME_MAX];
+	char real[SUSFS_OR_PATH_MAX];
+	bool rule_live;
+};
+
+static struct sufs_view_entry sufs_views[SUFS_VIEW_MAX];
+static int sufs_nviews;
+static DEFINE_MUTEX(sufs_views_lock);
+
+/* Caller holds sufs_views_lock. */
+static int sufs_view_find_locked(const char *name)
+{
+	int i;
+
+	for (i = 0; i < sufs_nviews; i++)
+		if (!strcmp(sufs_views[i].name, name))
+			return i;
+	return -1;
+}
+
 /* expose <view-name> <real-path> - the whole command surface for now.  Small on purpose: the shape
  * of the view is still being settled, and a command that is not here cannot be misused. */
 static int sufs_view_expose(char *args)
@@ -302,13 +345,49 @@ static int sufs_view_expose(char *args)
 	if (strlen(sufs_mnt_point) + 1 + strlen(name) + 1 > sizeof(view))
 		return -ENAMETOOLONG;
 
+	if (strlen(name) >= SUFS_VIEW_NAME_MAX)
+		return -ENAMETOOLONG;
 	scnprintf(view, sizeof(view), "%s/%s", sufs_mnt_point, name);
+
+	/* Claim the slot BEFORE the rule exists, so a name is never listed without a rule behind it.
+	 * (Two concurrent exposes could still both pass this check; the second one then fails to add
+	 * its rule in a way that leaves nothing half-done - see below.) */
+	mutex_lock(&sufs_views_lock);
+	if (sufs_view_find_locked(name) >= 0) {
+		mutex_unlock(&sufs_views_lock);
+		return -EEXIST;
+	}
+	if (sufs_nviews >= SUFS_VIEW_MAX) {
+		mutex_unlock(&sufs_views_lock);
+		return -ENOSPC;
+	}
+	mutex_unlock(&sufs_views_lock);
+
 	rc = susfs_open_redirect_add_view_rule(view, real);
-	if (rc)
+	if (rc) {
 		pr_warn("sufs_fs: expose %s -> %s failed %d\n", view, real, rc);
-	else
-		SUSFS_LOGI("sufs_fs: exposed %s at %s\n", real, view);
-	return rc;
+		return rc;
+	}
+
+	mutex_lock(&sufs_views_lock);
+	if (sufs_view_find_locked(name) >= 0 || sufs_nviews >= SUFS_VIEW_MAX) {
+		/* Lost a race after all.  The rule is live but unlisted; saying so is the honest end -
+		 * unexpose will not find it either, and the status line is where that shows up. */
+		mutex_unlock(&sufs_views_lock);
+		pr_warn("sufs_fs: expose %s: rule added but the name table did not take it\n", name);
+		return -EEXIST;
+	}
+	{
+		struct sufs_view_entry *e = &sufs_views[sufs_nviews++];
+
+		strscpy(e->name, name, sizeof(e->name));
+		strscpy(e->real, real, sizeof(e->real));
+		e->rule_live = true;
+	}
+	mutex_unlock(&sufs_views_lock);
+
+	SUSFS_LOGI("sufs_fs: exposed %s at %s (view now holds %d name(s))\n", real, view, sufs_nviews);
+	return 0;
 }
 
 /* A lookup that gets here is a miss: "control" is bound in the dcache at mount time, and every
@@ -546,6 +625,40 @@ int sufs_fs_detach(void)
 #endif
 }
 
+/* ---- the host check ----------------------------------------------------------------------
+ * The view's whole safety argument is "an unprivileged caller cannot reach the host directory", so
+ * that is verified at load time instead of assumed: the host must be root-owned with no x for
+ * other (0xx0).  A ROM update that widens the mode must not leave a reachable view behind - the
+ * check refuses to mount rather than mounting something an app could walk into. */
+static int sufs_check_host(const char *mntpoint)
+{
+	char parent[SUSFS_OR_PATH_MAX];
+	struct path path;
+	struct inode *inode;
+	char *slash;
+	int rc;
+
+	if (strlen(mntpoint) >= sizeof(parent))
+		return -ENAMETOOLONG;
+	strscpy(parent, mntpoint, sizeof(parent));
+	slash = strrchr(parent, '/');
+	if (!slash || slash == parent)	/* "/sufs" has no host directory to check */
+		return -EINVAL;
+	*slash = '\0';
+
+	rc = kern_path(parent, LOOKUP_FOLLOW | LOOKUP_DIRECTORY, &path);
+	if (rc)
+		return rc;
+	inode = d_backing_inode(path.dentry);
+	if (!inode) {
+		path_put(&path);
+		return -ENOENT;
+	}
+	rc = (uid_eq(inode->i_uid, GLOBAL_ROOT_UID) && !(inode->i_mode & S_IXOTH)) ? 0 : -EPERM;
+	path_put(&path);
+	return rc;
+}
+
 /* ---- layer entry points ------------------------------------------------------------------ */
 
 int sufs_fs_init(void)
@@ -559,6 +672,15 @@ int sufs_fs_init(void)
 	if (!sufs_mnt_point || sufs_mnt_point[0] != '/') {
 		pr_warn("sufs_fs: privfs_mnt must be an absolute path\n");
 		return -EINVAL;
+	}
+
+	/* Before anything is registered or mounted: the host directory has to be one an unprivileged
+	 * caller cannot enter, or none of this means what it says. */
+	rc = sufs_check_host(sufs_mnt_point);
+	if (rc) {
+		pr_err("sufs_fs: refusing to arm: the host of %s is not a 0xx0 root directory (%d) - an app could reach the view\n",
+		       sufs_mnt_point, rc);
+		return rc;
 	}
 
 	rc = register_filesystem(&sufs_fs_type);
