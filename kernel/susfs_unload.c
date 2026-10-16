@@ -47,10 +47,14 @@
 
 #define SUSFS_UNLOAD_NODE	"/proc/susfs_unload"
 
-/* Absolute, because a helper has no PATH of its own until it has exec'd.  On this device that
- * is the toybox symlink; override with unload_cmd= if a ROM puts it elsewhere. */
-static char *susfs_unload_cmd = "/system/bin/rmmod";
-module_param_named(unload_cmd, susfs_unload_cmd, charp, 0600);
+/* What the helper runs, as a SHELL COMMAND LINE - executed through /system/bin/sh -c rather than
+ * as "path argv[1]".  Two reasons, both learned the hard way: the helper's own stdout/stderr go
+ * nowhere observable, so the only way to tell "did not exec" from "ran and failed" is to let the
+ * caller append diagnostics to the command line, e.g.
+ *   unload_helper="rmmod susfs_guard_lkm; echo rc=$? > /data/local/tmp/umh.log; id >> ..."
+ * and a plain argv form cannot express that. */
+static char *susfs_unload_helper = "rmmod susfs_guard_lkm";
+module_param_named(unload_helper, susfs_unload_helper, charp, 0600);
 
 struct susfs_unload_req {
 	struct callback_head cb;
@@ -66,25 +70,27 @@ static atomic_t susfs_unload_failures = ATOMIC_INIT(0);
 static void susfs_unload_task_work(struct callback_head *cb)
 {
 	struct susfs_unload_req *req = container_of(cb, struct susfs_unload_req, cb);
-	char *path, *name, *env_home, *env_path;
+	char *path, *flag, *cmdline, *env_home, *env_path;
 	char **argv, **envp;
 	int rc;
 
-	path = kstrdup(susfs_unload_cmd, GFP_ATOMIC);
-	name = kstrdup(SUSFS_LKM_MODULE_NAME, GFP_ATOMIC);
+	path = kstrdup("/system/bin/sh", GFP_ATOMIC);
+	flag = kstrdup("-c", GFP_ATOMIC);
+	cmdline = kstrdup(susfs_unload_helper, GFP_ATOMIC);
 	env_home = kstrdup("HOME=/", GFP_ATOMIC);
 	env_path = kstrdup("PATH=/sbin:/system/bin:/system/xbin", GFP_ATOMIC);
-	argv = kmalloc_array(3, sizeof(char *), GFP_ATOMIC);
+	argv = kmalloc_array(4, sizeof(char *), GFP_ATOMIC);
 	envp = kmalloc_array(3, sizeof(char *), GFP_ATOMIC);
-	if (!path || !name || !env_home || !env_path || !argv || !envp) {
+	if (!path || !flag || !cmdline || !env_home || !env_path || !argv || !envp) {
 		atomic_inc(&susfs_unload_failures);
 		pr_warn("susfs_unload: out of memory - run rmmod %s by hand (the view is already detached, so it will work)\n",
 			SUSFS_LKM_MODULE_NAME);
 		goto out;
 	}
 	argv[0] = path;
-	argv[1] = name;
-	argv[2] = NULL;
+	argv[1] = flag;
+	argv[2] = cmdline;
+	argv[3] = NULL;
 	envp[0] = env_home;
 	envp[1] = env_path;
 	envp[2] = NULL;
@@ -92,11 +98,10 @@ static void susfs_unload_task_work(struct callback_head *cb)
 	rc = call_usermodehelper(path, argv, envp, UMH_NO_WAIT);
 	if (rc) {
 		atomic_inc(&susfs_unload_failures);
-		pr_warn("susfs_unload: could not start %s (%d) - run rmmod %s by hand (the view is already detached)\n",
-			path, rc, SUSFS_LKM_MODULE_NAME);
+		pr_warn("susfs_unload: could not start the helper (%d) - run '%s' by hand (the view is already detached)\n",
+			rc, susfs_unload_helper);
 	} else {
-		SUSFS_LOGI("susfs_unload: asked the kernel to run %s %s\n", path,
-			SUSFS_LKM_MODULE_NAME);
+		SUSFS_LOGI("susfs_unload: asked the kernel to run: %s\n", susfs_unload_helper);
 	}
 out:
 	kfree(req);
@@ -144,14 +149,14 @@ static ssize_t susfs_unload_write(struct file *file, const char __user *buf, siz
 		return rc;
 	}
 	atomic_inc(&susfs_unload_requests);
-	SUSFS_LOGI("susfs_unload: view detached, unload queued (helper %s)\n", susfs_unload_cmd);
+	SUSFS_LOGI("susfs_unload: view detached, unload queued (helper: %s)\n", susfs_unload_helper);
 	return len;
 }
 
 static int susfs_unload_show(struct seq_file *m, void *v)
 {
 	seq_printf(m, "susfs_unload: helper=%s requests=%d failures=%d view_mounted=%d\n",
-		   susfs_unload_cmd, atomic_read(&susfs_unload_requests),
+		   susfs_unload_helper, atomic_read(&susfs_unload_requests),
 		   atomic_read(&susfs_unload_failures), sufs_fs_mounted() ? 1 : 0);
 	return 0;
 }
