@@ -149,11 +149,12 @@ static struct {
 static int fail_layer;
 module_param_named(fail_layer, fail_layer, int, 0644);
 
-/* Diagnostics: leave /sys/module/<name> in place (0 = the default, which removes it).  The same
- * role KernelSU's CONFIG_KSU_DEBUG plays for its own kobject_del(): once the directory is gone a
- * module parameter cannot be inspected after load, and this is how that is traded back. */
-static bool susfs_keep_sysfs_dir;
-module_param_named(sysfs_dir, susfs_keep_sysfs_dir, bool, 0600);
+/* OPT-IN while this is still a test build.  The kobject_del() route cost two panics on this
+ * device to get right (see the call site), so until the whole unload path has been proven end to
+ * end it is NOT armed by default: a normal load leaves /sys/module/<name> exactly like any other
+ * module's.  Arm it with hide_sysfs_dir=1. */
+static bool susfs_hide_sysfs_dir;
+module_param_named(hide_sysfs_dir, susfs_hide_sysfs_dir, bool, 0600);
 
 /* Not __init/__exit: it is called from both, and an __exit callee in __init code is a
  * modpost section mismatch. */
@@ -252,7 +253,7 @@ static int __init susfs_init(void)
      * mod_sysfs_teardown() calls kobject_del() again when the module is finally freed: that is
      * safe (kernfs_remove() on an already removed node is a no-op, kobject_put(NULL) is guarded),
      * which is what makes the one-liner usable instead of a leak. */
-    if (!susfs_keep_sysfs_dir) {
+    if (susfs_hide_sysfs_dir) {
         /* free_module() runs module_param_sysfs_remove() BEFORE it deletes the kobject, and that
          * helper goes through sysfs_remove_group(kobj, grp) -> kernfs_find_and_get_ns(kobj->sd,
          * ...), which - unlike sysfs_remove_file() - does NOT check kobj->sd for NULL, while
@@ -262,10 +263,14 @@ static int __init susfs_init(void)
          *   -> free_module -> __se_sys_delete_module
          *   Kernel panic - not syncing: Oops: Fatal exception
          *
-         * KernelSU's one-liner is safe for KernelSU because its LKM declares no module
-         * parameters, so mkobj.mp stays NULL and that branch is never reached.  This module has
-         * several (expose_proc, privfs, fail_layer, ...), so the difference matters - it is the
-         * whole reason this comment exists.
+         * KernelSU's one-liner is safe for KernelSU because KernelSU is never unloaded: rmmod is
+         * not a supported operation there (the LKM is resident by design), so free_module() never
+         * meets the state kobject_del() leaves behind.  On top of that, KernelSU's LKM declares
+         * no module parameters at all, so mkobj.mp would keep that branch from being taken even
+         * if it were unloaded.  This module is unloaded on every test run and in normal
+         * operation, AND it has several parameters (expose_proc, privfs, fail_layer, ...), so
+         * both halves of that difference apply here - which is the whole reason this comment
+         * exists.
          *
          * Dropping the attribute block first - the very kfree() module_param_free() would do; mp
          * and its attrs[] are a single allocation - makes module_param_sysfs_remove() return
@@ -274,6 +279,7 @@ static int __init susfs_init(void)
         kfree(THIS_MODULE->mkobj.mp);
         THIS_MODULE->mkobj.mp = NULL;
         kobject_del(&THIS_MODULE->mkobj.kobj);
+        SUSFS_LOGI("susfs: /sys/module/%s removed (hide_sysfs_dir=1)\n", SUSFS_LKM_MODULE_NAME);
     }
 
     return 0;
