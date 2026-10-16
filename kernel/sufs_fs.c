@@ -338,6 +338,57 @@ static __nocfi int sufs_do_umount(const char *mntpoint, int flags)
 }
 #endif /* >= 5.12 */
 
+/* ---- detach / state ---------------------------------------------------------------------- */
+
+bool sufs_fs_mounted(void)
+{
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
+	return sufs_is_mounted;
+#else
+	return false;
+#endif
+}
+
+/* Detach the mount WITHOUT unregistering the filesystem.  Idempotent, and the reason
+ * /proc/susfs_unload can work at all: while this mount is up the superblock holds a reference on
+ * this module (get_fs_type() -> try_module_get()), so the kernel refuses the unload with EAGAIN
+ * until it is gone.
+ *
+ * -EINVAL/-ENOENT mean the path is not (or no longer) OUR mount - someone unmounted it from
+ * userspace first - which is a SUCCESS here.  This branch is the difference between working and
+ * a panic: the first version of this code read that -EINVAL as "cannot detach, hold the module
+ * back", returned early from exit(), skipped unregister_filesystem(), and left the global
+ * file_systems list pointing at freed module memory:
+ *   filesystems_proc_show+0x50/0xa0 -> seq_read_iter -> __arm64_sys_read
+ *   Kernel panic - not syncing: Oops: Fatal exception
+ * i.e. a plain 'cat /proc/filesystems'.  A lazy detach is the fallback when something still
+ * holds the mount; an open file cannot refuse it. */
+int sufs_fs_detach(void)
+{
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
+	int rc;
+
+	if (!sufs_is_mounted)
+		return 0;
+
+	rc = sufs_do_umount(sufs_mnt_point, 0);
+	if (rc == -EINVAL || rc == -ENOENT)
+		rc = 0;
+	if (rc) {
+		rc = sufs_do_umount(sufs_mnt_point, MNT_DETACH);
+		if (rc == -EINVAL || rc == -ENOENT)
+			rc = 0;
+	}
+	if (!rc) {
+		sufs_is_mounted = false;
+		SUSFS_LOGI("sufs_fs: detached %s\n", sufs_mnt_point);
+	}
+	return rc;
+#else
+	return 0;
+#endif
+}
+
 /* ---- layer entry points ------------------------------------------------------------------ */
 
 int sufs_fs_init(void)
@@ -397,41 +448,12 @@ int sufs_fs_init(void)
 
 void sufs_fs_exit(void)
 {
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
-	if (sufs_is_mounted) {
-		int rc = sufs_do_umount(sufs_mnt_point, 0);
-
-		/* -EINVAL/-ENOENT means the path is not (or no longer) OUR mount, i.e. someone
-		 * unmounted it from userspace first.  From here that is a SUCCESS: there is nothing
-		 * left to detach.
-		 *
-		 * This branch is not cosmetic.  Measured on the device (PJA110, 5.15.180): without it
-		 * a userspace umount made the old "umount failed -> hold the module back" path return
-		 * early, unregister_filesystem() never ran, the module was freed anyway (an exit
-		 * function runs after delete_module()'s refcount check, so __module_get() there is far
-		 * too late to stop the unload), and the global file_systems list kept pointing at
-		 * freed memory.  The next reader of that list died:
-		 *   filesystems_proc_show+0x50/0xa0 -> seq_read_iter -> __arm64_sys_read
-		 *   Kernel panic - not syncing: Oops: Fatal exception
-		 * i.e. a plain 'cat /proc/filesystems'.  Never let this path return without running
-		 * unregister_filesystem(). */
-		if (rc == -EINVAL || rc == -ENOENT)
-			rc = 0;
-
-		/* Still attached (something holds it): a lazy detach is the strongest thing available
-		 * from here, and an open file cannot refuse it. */
-		if (rc) {
-			rc = sufs_do_umount(sufs_mnt_point, MNT_DETACH);
-			if (rc == -EINVAL || rc == -ENOENT)
-				rc = 0;
-		}
-		if (rc)
-			pr_err("sufs_fs: could not detach %s (%d) - unregistering anyway\n",
-			       sufs_mnt_point, rc);
-
-		sufs_is_mounted = false;
-	}
-#endif /* >= 5.12 */
+	/* The mount has to be gone before the filesystem is unregistered, and a userspace umount
+	 * may already have done it - sufs_fs_detach() is idempotent and treats "this is not our
+	 * mount any more" as success (its comment records the panic that the opposite reading
+	 * caused).  /proc/susfs_unload calls the very same function first, so both ways out of this
+	 * module detach the same way. */
+	(void)sufs_fs_detach();
 
 	if (sufs_is_registered) {
 		int rc = unregister_filesystem(&sufs_fs_type);

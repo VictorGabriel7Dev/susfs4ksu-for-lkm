@@ -104,6 +104,9 @@ static const struct susfs_import susfs_imports[] = {
     IMP(copy_to_kernel_nofault),
     IMP(security_secctx_to_secid),
     IMP(stop_machine),
+    /* /proc/susfs_unload runs rmmod through the kernel's helper; a loader that left this at zero
+     * would jump to address 0 the moment somebody asks the module to leave. */
+    IMP(call_usermodehelper),
     IMP(tracepoint_probe_register),
     IMP(tracepoint_probe_unregister),
     IMP(register_kprobe),

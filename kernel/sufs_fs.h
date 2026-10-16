@@ -20,6 +20,14 @@
 int sufs_fs_init(void);
 void sufs_fs_exit(void);
 
+/* Detach the view's mount without unregistering the filesystem (idempotent; 0 when the mount is
+ * already gone).  /proc/susfs_unload calls this before it asks for the unload, because a mounted
+ * filesystem holds a reference on this module and the kernel refuses rmmod until it is gone. */
+int sufs_fs_detach(void);
+
+/* Whether the view is mounted right now (for the unload node's status line). */
+bool sufs_fs_mounted(void);
+
 /* Non-zero only while the filesystem is registered (used by the layer teardown's own log). */
 bool sufs_fs_registered(void);
 

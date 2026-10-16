@@ -226,4 +226,11 @@ int sus_mount_privfs_arm(const char *mntpoint);
 int sufs_fs_init(void);
 void sufs_fs_exit(void);
 
+/* /proc/susfs_unload (kernel/susfs_unload.c): write 1 and the module takes itself out - detach
+ * the privileged view first (a mounted filesystem holds a reference on this module, so the
+ * kernel refuses the unload until it is gone), then ask userspace to run rmmod, because a module
+ * cannot safely unload itself. */
+int susfs_unload_init(void);
+void susfs_unload_exit(void);
+
 #endif
