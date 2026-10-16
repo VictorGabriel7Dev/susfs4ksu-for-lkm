@@ -435,12 +435,12 @@ static int sufs_view_expose(char *args)
 	rc = susfs_open_redirect_add_view_rule(view, real);
 	if (rc) {
 		if (sufs_view_root) {
-			struct qstr q = QSTR_INIT(name, strlen(name));
-			struct dentry *victim = d_lookup(sufs_view_root, &q);
+			struct path p;
 
-			if (victim) {
-				d_drop(victim);
-				dput(victim);
+			/* Same reason as in unexpose: the lookup path computes the hash for us. */
+			if (kern_path(view, 0, &p) == 0) {
+				d_drop(p.dentry);
+				path_put(&p);
 			}
 		}
 		pr_warn("sufs_fs: expose %s -> %s failed %d\n", view, real, rc);
@@ -496,13 +496,18 @@ static int sufs_view_unexpose(char *args)
 	 * dcache_readdir skips dentries that are no longer hashed.  d_lookup() is enough because the
 	 * dentry - when it still exists - sits in the dcache at count 0; if it was already reclaimed
 	 * the name is not listed any more either, which is the same outcome. */
+	/* Remove the name from the listing.  kern_path() rather than d_lookup(): a qstr built by hand
+	 * carries hash 0 (QSTR_INIT sets len and name, nothing else) while d_lookup() searches BY
+	 * HASH - measured, it found nothing even though the dentry was right there in the listing.
+	 * Going through the normal lookup path lets the kernel compute the hash, and it covers the
+	 * other case for free: the table no longer has this name, so a lookup that finds nothing in
+	 * the dcache answers with a negative dentry, which is the same as "not listed". */
 	if (sufs_view_root) {
-		struct qstr q = QSTR_INIT(name, strlen(name));
-		struct dentry *victim = d_lookup(sufs_view_root, &q);
+		struct path p;
 
-		if (victim) {
-			d_drop(victim);
-			dput(victim);
+		if (kern_path(view, 0, &p) == 0) {
+			d_drop(p.dentry);
+			path_put(&p);
 		}
 	}
 	SUSFS_LOGI("sufs_fs: unexposed %s (view now holds %d name(s))\n", name, sufs_nviews);
