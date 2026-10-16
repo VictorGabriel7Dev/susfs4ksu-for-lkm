@@ -118,6 +118,12 @@ struct sufs_view_entry {
 	char name[SUFS_VIEW_NAME_MAX];
 	char real[SUSFS_OR_PATH_MAX];
 	unsigned long ino;	/* this name's own inode number; 0 = free slot */
+	/* The dentry built for this name, with a reference of OUR own (d_alloc_name()'s one went to
+	 * the dcache with d_add()).  Keeping the pointer is what makes unexpose reliable: looking the
+	 * dentry up by name at that point was measured to find nothing (the listing still showed the
+	 * name, and the log said "no dentry to remove"), and without the dentry there is no way to
+	 * take the name out of the listing. */
+	struct dentry *dentry;
 };
 
 static struct sufs_view_entry sufs_views[SUFS_VIEW_MAX];
@@ -419,6 +425,7 @@ static int sufs_view_expose(char *args)
 			return -ENOMEM;
 		}
 		d_add(d, inode);
+		dget(d);	/* our own reference; released by unexpose or put_super() */
 	}
 
 	rc = susfs_open_redirect_add_view_rule(view, real);
@@ -437,6 +444,7 @@ static int sufs_view_expose(char *args)
 		strscpy(e->name, name, sizeof(e->name));
 		strscpy(e->real, real, sizeof(e->real));
 		e->ino = ino;
+		e->dentry = d;
 	}
 	mutex_unlock(&sufs_views_lock);
 
@@ -452,6 +460,7 @@ static int sufs_view_expose(char *args)
 static int sufs_view_unexpose(char *args)
 {
 	char view[SUSFS_OR_PATH_MAX];
+	struct dentry *d;
 	char *name = args;
 	int i;
 
@@ -469,6 +478,7 @@ static int sufs_view_unexpose(char *args)
 		mutex_unlock(&sufs_views_lock);
 		return -ENOENT;
 	}
+	d = sufs_views[i].dentry;
 	memmove(&sufs_views[i], &sufs_views[i + 1],
 		(size_t)(sufs_nviews - i - 1) * sizeof(sufs_views[0]));
 	sufs_nviews--;	/* the entry's ino goes back to the pool with it */
@@ -476,21 +486,13 @@ static int sufs_view_unexpose(char *args)
 
 	susfs_open_redirect_del_view_rule(view);
 
-	/* Remove the dentry, which is what removes the name from the listing (the listing IS the
-	 * dcache - see sufs_view_expose).  d_delete() rather than a bare d_drop(): dropping it from
-	 * the hash leaves the dentry positive and merely unhashed, and a listing that walks d_subdirs
-	 * still has to decide about it; d_delete() turns it into the negative dentry the name now
-	 * deserves.  Either way dput() hands back the reference d_lookup() returned. */
-	if (sufs_view_root) {
-		struct qstr q = QSTR_INIT(name, strlen(name));
-		struct dentry *d = d_lookup(sufs_view_root, &q);
-
-		if (d) {
-			d_delete(d);
-			dput(d);
-		} else {
-			pr_warn("sufs_fs: unexpose %s: no dentry to remove (listing may keep showing it)\n", name);
-		}
+	/* Take the name out of the listing: the listing IS the dcache (see sufs_view_expose), and
+	 * dcache_readdir skips dentries that are no longer hashed.  d_drop() plus giving back the
+	 * reference we kept is enough; a later lookup for the name finds no dcache entry, asks the
+	 * table, gets "not there", and hands out a negative dentry. */
+	if (d) {
+		d_drop(d);
+		dput(d);
 	}
 	SUSFS_LOGI("sufs_fs: unexposed %s (view now holds %d name(s))\n", name, sufs_nviews);
 	return 0;
@@ -558,6 +560,21 @@ static void sufs_put_super(struct super_block *sb)
 	 * d_add().  The placeholder inode needs no such care: iget_locked() gave it a normal
 	 * dcache-owned life. */
 	sufs_view_root = NULL;
+	{
+		int i;
+
+		/* Any dentry the table still holds: drop it and give the reference back. */
+		mutex_lock(&sufs_views_lock);
+		for (i = 0; i < sufs_nviews; i++) {
+			if (sufs_views[i].dentry) {
+				d_drop(sufs_views[i].dentry);
+				dput(sufs_views[i].dentry);
+				sufs_views[i].dentry = NULL;
+			}
+		}
+		sufs_nviews = 0;
+		mutex_unlock(&sufs_views_lock);
+	}
 	if (sufs_ctl_inode) {
 		iput(sufs_ctl_inode);
 		sufs_ctl_inode = NULL;
