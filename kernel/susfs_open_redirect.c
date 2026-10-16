@@ -959,6 +959,9 @@ static const struct proc_ops or_proc_ops = {
 
 static struct proc_dir_entry *or_proc_entry;
 
+/* Declared up here because the view entry point below is defined before or_add(). */
+static int or_add(const char *target, const char *redirected, int scheme);
+
 /* The privileged view's rule: expose a REAL file at a view path (kernel/sufs_fs.c).  Same
  * mechanism as every other rule - the difference is who creates it and what it is for.  A rule
  * needs its target to resolve to an inode (or_add() below), which is exactly why the view answers
