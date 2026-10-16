@@ -468,7 +468,6 @@ static int sufs_view_expose(char *args)
 static int sufs_view_unexpose(char *args)
 {
 	char view[SUSFS_OR_PATH_MAX];
-	struct dentry *d;
 	char *name = args;
 	int i;
 
