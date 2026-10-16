@@ -34,6 +34,7 @@
 #include <linux/init.h>
 #include <linux/version.h>
 #include <linux/fs.h>
+#include <linux/fs_context.h>
 #include <linux/dcache.h>
 #include <linux/namei.h>
 #include <linux/mount.h>
@@ -56,6 +57,11 @@
 #define SUFS_CTL_NAME		"control"
 #define SUFS_CTL_BUF		256
 #define SUFS_MAGIC		0x53465553	/* "SUFS" */
+/* Fixed inode numbers: the first is the root d_make_root() owns, the second the one node, which
+ * is kept in the inode cache through iget_locked() so that unrelated lookups share one inode
+ * instead of allocating (and never freeing) a fresh one per lookup. */
+#define SUFS_ROOT_INO		1
+#define SUFS_CTL_INO		2
 
 /* ---- the switch, and where the view is mounted ------------------------------------------
  * Both are 0600: they decide where a root-only view appears on the filesystem, which is not
@@ -92,26 +98,17 @@ static atomic_t sufs_ctl_reads = ATOMIC_INIT(0);
 static atomic_t sufs_ctl_writes = ATOMIC_INIT(0);
 static atomic_t sufs_ctl_denied = ATOMIC_INIT(0);
 
-static struct inode *sufs_new_inode(struct super_block *sb, umode_t mode)
+/* The timestamps are spelled three ways across the trees this module is built for, and no
+ * spelling is a superset of another:
+ *   - below 6.6 the three fields are plain members;
+ *   - 6.6 made i_ctime private (__i_ctime) and added the setter for it, while i_atime/mtime
+ *     were still direct members;
+ *   - 6.11 split i_atime/mtime into sec/nsec pairs, so from 6.12 (the next GKI tree in the
+ *     matrix) only the accessors compile.
+ * The one-call helper for this (simple_inode_init_ts) is not present in every tree the matrix
+ * builds, so this gate is the portable spelling. */
+static void sufs_set_times(struct inode *inode)
 {
-	struct inode *inode = new_inode(sb);
-
-	if (!inode)
-		return NULL;
-
-	inode->i_ino = get_next_ino();
-	inode->i_mode = mode;
-	inode->i_uid = GLOBAL_ROOT_UID;
-	inode->i_gid = GLOBAL_ROOT_GID;
-	/* The timestamps are spelled three ways across the trees this module is built for, and no
-	 * spelling is a superset of another:
-	 *   - below 6.6 the three fields are plain members;
-	 *   - 6.6 made i_ctime private (__i_ctime) and added the setter for it, while i_atime/mtime
-	 *     were still direct members;
-	 *   - 6.11 split i_atime/mtime into sec/nsec pairs, so from 6.12 (the next GKI tree in the
-	 *     matrix) only the accessors compile.
-	 * The one-call helper for this (simple_inode_init_ts) is not present in every tree the matrix
-	 * builds, so the three-way gate is the portable spelling. */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
 	struct timespec64 now = current_time(inode);
 
@@ -124,7 +121,6 @@ static struct inode *sufs_new_inode(struct super_block *sb, umode_t mode)
 #else
 	inode->i_atime = inode->i_mtime = inode->i_ctime = current_time(inode);
 #endif
-	return inode;
 }
 
 static ssize_t sufs_ctl_read(struct file *file, char __user *buf, size_t len, loff_t *ppos)
@@ -183,7 +179,13 @@ static const struct file_operations sufs_ctl_fops = {
 	.owner = THIS_MODULE,
 	.read = sufs_ctl_read,
 	.write = sufs_ctl_write,
+	/* no_llseek was renamed noop_llseek in 6.12, and leaving the member out is not the same
+	 * thing either (vfs_llseek() substitutes its own default), so both names are spelled. */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
+	.llseek = noop_llseek,
+#else
 	.llseek = no_llseek,
+#endif
 };
 
 /* The node exists only under its own name; everything else is a negative dentry, i.e. the
@@ -197,11 +199,21 @@ static struct dentry *sufs_lookup(struct inode *dir, struct dentry *dentry, unsi
 	    memcmp(dentry->d_name.name, ctl, sizeof(ctl) - 1))
 		return NULL;
 
-	inode = sufs_new_inode(dir->i_sb, S_IFREG | 0600);
+	/* iget_locked() is what keeps this to ONE inode for the node's whole life: without it every
+	 * lookup would allocate a fresh inode that stays in the cache (i_nlink != 0), i.e. the
+	 * module would leak a little memory per stat(). */
+	inode = iget_locked(dir->i_sb, SUFS_CTL_INO);
 	if (!inode)
 		return ERR_PTR(-ENOMEM);
-	inode->i_fop = &sufs_ctl_fops;
-	inode->i_size = 0;
+	if (inode->i_state & I_NEW) {
+		inode->i_mode = S_IFREG | 0600;
+		inode->i_uid = GLOBAL_ROOT_UID;
+		inode->i_gid = GLOBAL_ROOT_GID;
+		inode->i_fop = &sufs_ctl_fops;
+		inode->i_size = 0;
+		sufs_set_times(inode);
+		unlock_new_inode(inode);
+	}
 	return d_splice_alias(inode, dentry);
 }
 
@@ -210,13 +222,14 @@ static const struct inode_operations sufs_dir_iops = {
 };
 
 /* s_op must not be NULL: alloc_inode() dereferences it (fs/inode.c), so a filesystem without
- * one crashes on the first inode allocation. */
+ * one crashes on the first inode allocation.  There is deliberately no .drop_inode: the default
+ * (evict once i_nlink reaches 0) is what generic_delete_inode() did, and that symbol is gone
+ * from 6.12 on; the node's single cached inode makes accumulating anything impossible. */
 static const struct super_operations sufs_sops = {
 	.statfs = simple_statfs,
-	.drop_inode = generic_delete_inode,
 };
 
-static int sufs_fill_super(struct super_block *sb, void *data, int silent)
+static int sufs_fill_super(struct super_block *sb, struct fs_context *fc)
 {
 	struct inode *root;
 
@@ -224,12 +237,17 @@ static int sufs_fill_super(struct super_block *sb, void *data, int silent)
 	sb->s_op = &sufs_sops;
 	sb->s_time_gran = 1;
 
-	root = sufs_new_inode(sb, S_IFDIR | 0700);
+	root = new_inode(sb);
 	if (!root)
 		return -ENOMEM;
+	root->i_ino = SUFS_ROOT_INO;
+	root->i_mode = S_IFDIR | 0700;
+	root->i_uid = GLOBAL_ROOT_UID;
+	root->i_gid = GLOBAL_ROOT_GID;
 	root->i_op = &sufs_dir_iops;
 	root->i_fop = &simple_dir_operations;
 	set_nlink(root, 2);
+	sufs_set_times(root);
 
 	/* d_make_root() consumes the reference (it iputs on failure), so the error path must not. */
 	sb->s_root = d_make_root(root);
@@ -238,16 +256,28 @@ static int sufs_fill_super(struct super_block *sb, void *data, int silent)
 	return 0;
 }
 
-static struct dentry *sufs_mount(struct file_system_type *fs_type, int flags,
-				 const char *dev_name, void *data)
+/* The fs_context path, not the legacy .mount callback: mount_nodev() - the helper the old shape
+ * is written with - is gone from the 6.12/6.18 trees, and this is the path sys_mount() and
+ * path_mount() take anyway. */
+static int sufs_get_tree(struct fs_context *fc)
 {
-	return mount_nodev(fs_type, flags, data, sufs_fill_super);
+	return get_tree_nodev(fc, sufs_fill_super);
+}
+
+static const struct fs_context_operations sufs_fs_context_ops = {
+	.get_tree = sufs_get_tree,
+};
+
+static int sufs_init_fs_context(struct fs_context *fc)
+{
+	fc->ops = &sufs_fs_context_ops;
+	return 0;
 }
 
 static struct file_system_type sufs_fs_type = {
 	.owner = THIS_MODULE,
 	.name = SUFS_FS_NAME,
-	.mount = sufs_mount,
+	.init_fs_context = sufs_init_fs_context,
 	.kill_sb = kill_litter_super,
 };
 
@@ -372,9 +402,9 @@ void sufs_fs_exit(void)
 		int rc = sufs_do_umount(sufs_mnt_point);
 
 		if (rc) {
-			/* An unmounted-but-registered filesystem is the dangerous order; a registered
-			 * filesystem that is still MOUNTED when this module's memory goes away is worse.
-			 * Hold a reference on ourselves so rmmod fails with EBUSY instead. */
+			/* A registered filesystem that is still MOUNTED when this module's memory goes
+			 * away is the dangerous order; hold a reference on ourselves so rmmod fails with
+			 * EBUSY instead. */
 			pr_err("sufs_fs: umount %s failed %d - refusing to let this module unload\n",
 			       sufs_mnt_point, rc);
 			__module_get(THIS_MODULE);
