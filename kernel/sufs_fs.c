@@ -663,6 +663,12 @@ static struct file_system_type sufs_fs_type = {
  * variants register the filesystem but leave mounting to userspace - the layer logs it
  * rather than pretending the view is up. */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
+/* PROTOTYPE, NOT A GUARANTEE: these two are resolved from kallsyms and called through pointers,
+ * so the compiler never sees the kernel's own declaration and nothing checks the types for us.
+ * The shapes below were read out of the 5.15 and 6.6 trees (path_umount is character-for-character
+ * the same in both; path_mount is 5.15-verified, 6.6 not yet).  Before this layer is claimed to
+ * work on another kernel, compare these against that tree's fs/namespace.c - "the build passed"
+ * says nothing about a runtime-resolved symbol.  See the notes report on version scope. */
 typedef int (*sufs_path_mount_fn)(const char *dev_name, struct path *path,
 				  const char *type_page, unsigned long flags,
 				  void *data_page);
