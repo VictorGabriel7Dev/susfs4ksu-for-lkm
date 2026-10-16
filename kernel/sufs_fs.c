@@ -476,14 +476,20 @@ static int sufs_view_unexpose(char *args)
 
 	susfs_open_redirect_del_view_rule(view);
 
-	/* Take the dentry out of the dcache, which is what removes the name from the listing. */
+	/* Remove the dentry, which is what removes the name from the listing (the listing IS the
+	 * dcache - see sufs_view_expose).  d_delete() rather than a bare d_drop(): dropping it from
+	 * the hash leaves the dentry positive and merely unhashed, and a listing that walks d_subdirs
+	 * still has to decide about it; d_delete() turns it into the negative dentry the name now
+	 * deserves.  Either way dput() hands back the reference d_lookup() returned. */
 	if (sufs_view_root) {
 		struct qstr q = QSTR_INIT(name, strlen(name));
 		struct dentry *d = d_lookup(sufs_view_root, &q);
 
 		if (d) {
-			d_drop(d);
+			d_delete(d);
 			dput(d);
+		} else {
+			pr_warn("sufs_fs: unexpose %s: no dentry to remove (listing may keep showing it)\n", name);
 		}
 	}
 	SUSFS_LOGI("sufs_fs: unexposed %s (view now holds %d name(s))\n", name, sufs_nviews);
