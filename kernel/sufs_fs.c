@@ -366,8 +366,6 @@ static int sufs_view_expose(char *args)
 {
 	char view[SUSFS_OR_PATH_MAX];
 	char *name = args, *real;
-	struct dentry *d = NULL;
-	struct inode *inode;
 	unsigned long ino;
 	int rc;
 
@@ -407,42 +405,8 @@ static int sufs_view_expose(char *args)
 
 	ino = sufs_view_ino_alloc_locked();
 
-	/* The dentry first: the listing is the dcache, and a name must be visible exactly while it
-	 * works.  d_add() consumes the inode reference. */
-	if (sufs_view_root) {
-		inode = sufs_view_inode(sufs_view_root->d_sb, ino);
-		if (IS_ERR(inode))
-			return PTR_ERR(inode);
-		d = d_alloc_name(sufs_view_root, name);
-		if (!d) {
-			iput(inode);
-			return -ENOMEM;
-		}
-		d_add(d, inode);
-		/* Hand back the reference d_alloc_name() gave us: d_add() does not consume it (fs/dcache.c
-		 * says so outright - "The entry was actually filled in earlier during d_alloc()").  A
-		 * dentry that still has a reference when the superblock is torn down is exactly what
-		 * shrink_dcache_parent() will NOT collect (it takes only d_lockref.count == 0), which is
-		 * what produced
-		 *   BUG: Dentry ...{i=4,n=second} still in use (1) [unmount of sufs sufs]
-		 * once per exposed name - measured, with the reference held.  At count 0 the dentry stays
-		 * in the dcache (the hash and the parent chain are what make it visible to a listing), so
-		 * the name is still listed and still findable by d_lookup() - it is just collectable. */
-		dput(d);
-		d = NULL;
-	}
-
 	rc = susfs_open_redirect_add_view_rule(view, real);
 	if (rc) {
-		if (sufs_view_root) {
-			struct path p;
-
-			/* Same reason as in unexpose: the lookup path computes the hash for us. */
-			if (kern_path(view, 0, &p) == 0) {
-				d_drop(p.dentry);
-				path_put(&p);
-			}
-		}
 		pr_warn("sufs_fs: expose %s -> %s failed %d\n", view, real, rc);
 		return rc;
 	}
@@ -479,6 +443,18 @@ static int sufs_view_unexpose(char *args)
 		return -ENAMETOOLONG;
 	scnprintf(view, sizeof(view), "%s/%s", sufs_mnt_point, name);
 
+	/* While the name is still in the table: that is what makes the lookup below find its dentry
+	 * (it is the table that decides whether a name exists at all).  d_drop() unhooks it, and the
+	 * reference kern_path() took goes back with path_put(). */
+	if (sufs_view_root) {
+		struct path p;
+
+		if (kern_path(view, 0, &p) == 0) {
+			d_drop(p.dentry);
+			path_put(&p);
+		}
+	}
+
 	mutex_lock(&sufs_views_lock);
 	i = sufs_view_find_locked(name);
 	if (i < 0) {
@@ -496,20 +472,6 @@ static int sufs_view_unexpose(char *args)
 	 * dcache_readdir skips dentries that are no longer hashed.  d_lookup() is enough because the
 	 * dentry - when it still exists - sits in the dcache at count 0; if it was already reclaimed
 	 * the name is not listed any more either, which is the same outcome. */
-	/* Remove the name from the listing.  kern_path() rather than d_lookup(): a qstr built by hand
-	 * carries hash 0 (QSTR_INIT sets len and name, nothing else) while d_lookup() searches BY
-	 * HASH - measured, it found nothing even though the dentry was right there in the listing.
-	 * Going through the normal lookup path lets the kernel compute the hash, and it covers the
-	 * other case for free: the table no longer has this name, so a lookup that finds nothing in
-	 * the dcache answers with a negative dentry, which is the same as "not listed". */
-	if (sufs_view_root) {
-		struct path p;
-
-		if (kern_path(view, 0, &p) == 0) {
-			d_drop(p.dentry);
-			path_put(&p);
-		}
-	}
 	SUSFS_LOGI("sufs_fs: unexposed %s (view now holds %d name(s))\n", name, sufs_nviews);
 	return 0;
 }
