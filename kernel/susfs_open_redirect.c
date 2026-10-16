@@ -976,6 +976,15 @@ int susfs_open_redirect_add_view_rule(const char *view_path, const char *real_pa
 	return or_add(view_path, real_path, UID_NON_APP_PROC);
 }
 
+/* Drop the rule a view name was created with (kernel/sufs_fs.c's unexpose).  or_del() runs with
+ * or_lock held, exactly like the /proc command path calls it. */
+void susfs_open_redirect_del_view_rule(const char *view_path)
+{
+	mutex_lock(&or_lock);
+	or_del(view_path);
+	mutex_unlock(&or_lock);
+}
+
 int susfs_open_redirect_init(void)
 {
 	int i;

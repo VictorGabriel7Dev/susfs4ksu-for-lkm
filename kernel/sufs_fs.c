@@ -200,6 +200,13 @@ static ssize_t sufs_ctl_write(struct file *file, const char __user *buf, size_t 
 			atomic_inc(&sufs_ctl_denied);
 			return rc;
 		}
+	} else if (!strncmp(tmp, "unexpose ", 9)) {
+		int rc = sufs_view_unexpose(tmp + 9);
+
+		if (rc) {
+			atomic_inc(&sufs_ctl_denied);
+			return rc;
+		}
 	} else if (strcmp(tmp, "status") && strcmp(tmp, "ping")) {
 		atomic_inc(&sufs_ctl_denied);
 		return -EINVAL;
@@ -390,6 +397,40 @@ static int sufs_view_expose(char *args)
 	return 0;
 }
 
+/* unexpose <view-name>: drop the rule and the table entry together.  The rule is removed after the
+ * table entry, so a name is never listed without a rule (the reverse window is the harmless one:
+ * for a moment the rule is gone while the name is still listed, and that listing answers with the
+ * placeholder sentence). */
+static int sufs_view_unexpose(char *args)
+{
+	char view[SUSFS_OR_PATH_MAX];
+	char *name = args;
+	int i;
+
+	while (*name == ' ')
+		name++;
+	if (!*name || strchr(name, ' ') || strchr(name, '/'))
+		return -EINVAL;
+	if (strlen(sufs_mnt_point) + 1 + strlen(name) + 1 > sizeof(view))
+		return -ENAMETOOLONG;
+	scnprintf(view, sizeof(view), "%s/%s", sufs_mnt_point, name);
+
+	mutex_lock(&sufs_views_lock);
+	i = sufs_view_find_locked(name);
+	if (i < 0) {
+		mutex_unlock(&sufs_views_lock);
+		return -ENOENT;
+	}
+	memmove(&sufs_views[i], &sufs_views[i + 1],
+		(size_t)(sufs_nviews - i - 1) * sizeof(sufs_views[0]));
+	sufs_nviews--;
+	mutex_unlock(&sufs_views_lock);
+
+	susfs_open_redirect_del_view_rule(view);
+	SUSFS_LOGI("sufs_fs: unexposed %s (view now holds %d name(s))\n", name, sufs_nviews);
+	return 0;
+}
+
 /* A lookup that gets here is a miss: "control" is bound in the dcache at mount time, and every
  * other name is a view name that exists as the placeholder.  The method itself must exist - the
  * VFS refuses to call into a directory whose i_op has no ->lookup. */
@@ -412,6 +453,46 @@ static struct dentry *sufs_lookup(struct inode *dir, struct dentry *dentry, unsi
 		return ERR_CAST(inode);
 	return d_splice_alias(inode, dentry);
 }
+
+/* The view root's listing, built from the NAME TABLE rather than from the dcache: a listing that
+ * reflects what happens to have been looked up before is a history, and two reads of the same
+ * directory would not agree with each other.  "control" is always there, every table entry follows
+ * in table order. */
+static int sufs_dir_iterate(struct file *file, struct dir_context *ctx)
+{
+	if (!dir_emit_dots(file, ctx))
+		return 0;
+
+	if (ctx->pos == 2) {
+		if (!dir_emit(ctx, SUFS_CTL_NAME, sizeof(SUFS_CTL_NAME) - 1, SUFS_CTL_INO, DT_REG))
+			return 0;
+		ctx->pos = 3;
+	}
+
+	for (;;) {
+		char name[SUFS_VIEW_NAME_MAX];
+		int i = (int)ctx->pos - 3;
+
+		mutex_lock(&sufs_views_lock);
+		if (i < 0 || i >= sufs_nviews) {
+			mutex_unlock(&sufs_views_lock);
+			break;
+		}
+		strscpy(name, sufs_views[i].name, sizeof(name));
+		mutex_unlock(&sufs_views_lock);
+
+		ctx->pos++;
+		if (!dir_emit(ctx, name, strlen(name), SUFS_VIEW_INO, DT_REG))
+			return 0;
+	}
+	return 0;
+}
+
+static const struct file_operations sufs_dir_fops = {
+	.owner = THIS_MODULE,
+	.iterate_shared = sufs_dir_iterate,
+	.llseek = generic_file_llseek,
+};
 
 static const struct inode_operations sufs_dir_iops = {
 	.lookup = sufs_lookup,
@@ -454,7 +535,7 @@ static int sufs_fill_super(struct super_block *sb, struct fs_context *fc)
 	root->i_uid = GLOBAL_ROOT_UID;
 	root->i_gid = GLOBAL_ROOT_GID;
 	root->i_op = &sufs_dir_iops;
-	root->i_fop = &simple_dir_operations;
+	root->i_fop = &sufs_dir_fops;
 	set_nlink(root, 2);
 	sufs_set_times(root);
 

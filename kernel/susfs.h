@@ -204,6 +204,9 @@ bool susfs_open_redirect_match_path(const struct path *path, char *buf, size_t b
  * (a placeholder name under the view mount) lands on @real_path.  Used only with privfs=1. */
 int susfs_open_redirect_add_view_rule(const char *view_path, const char *real_path);
 
+/* Remove the rule a view name was created with (the view's unexpose command). */
+void susfs_open_redirect_del_view_rule(const char *view_path);
+
 /* How many rules are live right now.  The name-layer hook runs for every open() on the system, so it
  * tests this before it resolves anything - a table with no live rule costs one load instead of a path
  * lookup, and deleting the last rule takes that cost away again.  Written under the rule lock. */
