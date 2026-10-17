@@ -1878,7 +1878,7 @@ static bool sus_path_path_is_ours(const char *path)
     return ours;
 }
 
-int sus_path_command(const char *val, int *removed_out)
+static int sus_path_command(const char *val, int *removed_out)
 {
     char cmd[SUS_PATH_LEN + 16];
     const char *arg;
@@ -2085,7 +2085,7 @@ static int sus_path_show_list(char *buf, const struct kernel_param *kp)
  * and registered in the self-protected set so everyone else gets ENOENT. */
 static struct proc_dir_entry *sus_path_node_entry;
 
-int sus_path_proc_show(struct seq_file *m, void *v)
+static int sus_path_proc_show(struct seq_file *m, void *v)
 {
     char *buf = kvmalloc(PAGE_SIZE, GFP_KERNEL);
     int n;

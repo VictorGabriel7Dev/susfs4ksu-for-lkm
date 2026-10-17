@@ -14,7 +14,7 @@
 #include "susfs_log.h"
 #include "susfs.h"	/* susfs_expose_proc */
 
-bool log_enabled = true;	/* non-static: the unified control node writes it as the "log" namespace */
+static bool log_enabled = true;
 
 /* Load-time switch, read-only in sysfs; the runtime switch is the /proc node and the supercall, the interfaces
  * upstream's userspace drives (ksud insmod ... enable_log=0).  A load that starts silent is the only state in
@@ -28,7 +28,7 @@ bool susfs_log_enabled(void)
 /* Deliberately NOT EXPORT_SYMBOL'd: the only user is this module (susfs_log.h wraps it), and an exported name
  * shows up as a [susfs_guard_lkm]-owned symbol in /proc/kallsyms - outward surface upstream SUSFS lacks. */
 
-int log_proc_show(struct seq_file *m, void *v)
+static int log_proc_show(struct seq_file *m, void *v)
 {
 	seq_printf(m, "%d\n", log_enabled ? 1 : 0);
 	return 0;

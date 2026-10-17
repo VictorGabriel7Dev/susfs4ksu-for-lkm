@@ -944,7 +944,7 @@ static void or_unregister(void)
 }
 
 /* ---- /proc/susfs_open_redirect ---- */
-int or_proc_show(struct seq_file *m, void *v);
+static int or_proc_show(struct seq_file *m, void *v);
 static int or_proc_open(struct inode *inode, struct file *file);
 static ssize_t or_proc_write(struct file *file, const char __user *buf,
 			     size_t len, loff_t *off);
@@ -1067,7 +1067,7 @@ void susfs_open_redirect_exit(void)
 	WRITE_ONCE(susfs_open_redirect_rules, 0);	/* the count the name layer reads; hook is already gone */
 }
 
-int or_proc_show(struct seq_file *m, void *v)
+static int or_proc_show(struct seq_file *m, void *v)
 {
 	int i;
 

@@ -567,7 +567,7 @@ static void susfs_opath_dump_all(void)
 }
 
 /* ---- /proc/susfs_opath ---- */
-int opath_proc_show(struct seq_file *m, void *v);
+static int opath_proc_show(struct seq_file *m, void *v);
 static int opath_proc_open(struct inode *inode, struct file *file);
 
 static const struct proc_ops opath_proc_ops = {
@@ -579,7 +579,7 @@ static const struct proc_ops opath_proc_ops = {
 
 static struct proc_dir_entry *opath_proc_entry;
 
-int opath_proc_show(struct seq_file *m, void *v)
+static int opath_proc_show(struct seq_file *m, void *v)
 {
 	int i;
 
