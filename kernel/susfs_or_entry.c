@@ -59,6 +59,7 @@
 #include <linux/atomic.h>
 #include <linux/limits.h>
 #include "susfs.h"
+#include "sufs_router.h"	/* the jump table (parent inode, name) -> target */
 #include "susfs_log.h"
 #include "symbol_resolver.h"
 #include "susfs_or_entry.h"
@@ -387,7 +388,10 @@ static __nocfi noinline long or_entry_redirect(const struct pt_regs *regs, int k
 
 	/* The target name is copied out of the rule while the lookup holds rcu_read_lock (rule slots are
 	 * recycled after a grace period, so nothing inside an entry may be used after this call). */
-	if (!susfs_open_redirect_match_path(&path, target, sizeof(target))) {
+	/* The view's jump table first, then the open_redirect rules: the table is the
+	 * view, the rules are the older per-inode mechanism, and both can name a target. */
+	if (!sufs_router_match_path(&path, target, sizeof(target)) &&
+	    !susfs_open_redirect_match_path(&path, target, sizeof(target))) {
 		path_put(&path);
 		return SUSFS_OR_ENTRY_PASS;
 	}
