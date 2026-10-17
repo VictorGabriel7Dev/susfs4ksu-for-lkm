@@ -147,7 +147,7 @@ static void avc_unregister(void)
 	mutex_unlock(&avc_ctl_lock);
 }
 
-static int avc_proc_show(struct seq_file *m, void *v)
+int avc_proc_show(struct seq_file *m, void *v)
 {
 	seq_printf(m, "%d (su_sid=%u priv_app_sid=%u enter=%d hits=%d)\n",
 		   avc_spoof_enabled ? 1 : 0, avc_su_sid, avc_priv_app_sid,

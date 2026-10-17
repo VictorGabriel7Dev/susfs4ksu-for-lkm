@@ -57,6 +57,20 @@ static atomic_t susfs_unload_requests = ATOMIC_INIT(0);
 static atomic_t susfs_unload_failures = ATOMIC_INIT(0);
 static bool susfs_unload_ready;
 
+/* The request itself, without a file or a user buffer, so the unified control node can
+ * expose it as the "unload" namespace without duplicating the semantics. */
+int susfs_unload_request(void)
+{
+	int rc = sufs_fs_detach();
+
+	if (rc) {
+		atomic_inc(&susfs_unload_failures);
+		pr_warn("susfs_unload: detaching the view failed %d - not marking the module unloadable\n", rc);
+		return rc;
+	}
+	return 0;
+}
+
 static ssize_t susfs_unload_write(struct file *file, const char __user *buf, size_t len,
 				  loff_t *off)
 {
@@ -77,12 +91,9 @@ static ssize_t susfs_unload_write(struct file *file, const char __user *buf, siz
 
 	/* The whole point: drop the reference the mounted view holds on this module.  Without this
 	 * the kernel refuses rmmod and nothing else here matters. */
-	rc = sufs_fs_detach();
-	if (rc) {
-		atomic_inc(&susfs_unload_failures);
-		pr_warn("susfs_unload: detaching the view failed %d - not marking the module unloadable\n", rc);
+	rc = susfs_unload_request();
+	if (rc)
 		return rc;
-	}
 
 	WRITE_ONCE(susfs_unload_ready, true);
 	atomic_inc(&susfs_unload_requests);
@@ -91,7 +102,7 @@ static ssize_t susfs_unload_write(struct file *file, const char __user *buf, siz
 	return len;
 }
 
-static int susfs_unload_show(struct seq_file *m, void *v)
+int susfs_unload_show(struct seq_file *m, void *v)
 {
 	seq_printf(m, "susfs_unload: requests=%d failures=%d ready=%d view_mounted=%d\n",
 		   atomic_read(&susfs_unload_requests), atomic_read(&susfs_unload_failures),

@@ -2046,7 +2046,7 @@ static const struct kernel_param_ops sus_mount_keep_ops = {
 /* 0600: root only; the whole directory is inside the one hide_modules hides. */
 module_param_cb(hide_mounts, &sus_mount_keep_ops, NULL, 0600);
 
-static int sus_mount_keep_proc_show(struct seq_file *m, void *v)
+int sus_mount_keep_proc_show(struct seq_file *m, void *v)
 {
 	sus_mount_keep_show_seq(m);
 	return 0;

@@ -2,25 +2,23 @@
 /*
  * susfs_ctl.c - one control node, namespaced commands: /proc/susfs
  *
- * Replaces the per-layer nodes with a single surface.  A write is a command whose first word names
- * the subsystem, so the line says which layer it belongs to:
+ * A write is a command whose first word names the subsystem, so the line says which layer it
+ * belongs to; each namespace forwards to that layer's own logic, so the grammar is unchanged and
+ * only the entry point moves.  A read prints every layer's own listing, one section each - the
+ * per-layer nodes answer through the same functions, so the two surfaces cannot drift.
  *
- *     echo "sus_path add /data/adb/x"      > /proc/susfs
- *     echo "sus_path del /data/adb/x"      > /proc/susfs
- *     echo "sus_path clear"                > /proc/susfs
- *     echo "sus_mount add /data/adb/"      > /proc/susfs
- *     echo "hide_modules reset"            > /proc/susfs
- *     echo "sufs expose <view> <real>"     > /proc/susfs      (ours)
- *     echo "sufs del <view>"               > /proc/susfs      (ours)
+ *     echo "sus_path add /data/adb/x"   > /proc/susfs
+ *     echo "sus_mount add /data/adb/"   > /proc/susfs
+ *     echo "hide_modules reset"         > /proc/susfs
+ *     echo "sufs expose <view> <real>"  > /proc/susfs
+ *     echo "log 1"                      > /proc/susfs
+ *     echo "unload 1"                   > /proc/susfs
+ *     cat /proc/susfs                    # banner + every layer's listing
  *
- * Each namespace forwards to the layer's existing command function, so the grammar those layers
- * already accept is unchanged - only the entry point moves.  Layers whose command surface is not
- * migrated yet keep their own node; this file does not pretend to own them.
+ * ro rules are deliberately absent: they exist only for the module's own nodes (this one included),
+ * never as something a user can add.
  *
- * ro rules are not handled here on purpose: they exist only for the module's own nodes (the very
- * node this file creates is one), never as something a user can add.
- *
- * The node follows the module convention: 0777 mode plus a uid check in ->open() that answers
+ * The node follows the module convention: 0777 mode plus a uid check in ->open() answering
  * -ENOENT, because a restrictive mode would answer EACCES and advertise the node's existence.  It
  * is listed in susfs_self_hide_paths so the listing does not show it either.
  */
@@ -30,6 +28,7 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/proc_fs.h>
+#include <linux/seq_file.h>
 #include <linux/string.h>
 #include <linux/types.h>
 #include <linux/uaccess.h>
@@ -39,11 +38,52 @@
 
 #define SUSFS_CTL_MAX	768
 
-/* The layers' own command entry points.  Reused as-is: their grammar is what the old nodes
- * accepted, so callers see no difference beyond the namespace word. */
+/* The layers' command entry points (their own grammar). */
 extern int sus_path_command(const char *val, int *removed_out);
 extern int sus_mount_keep_command(const char *val, bool bare_list);
 extern int hide_modules_command(const char *val, bool bare_list);
+extern int susfs_unload_request(void);
+extern bool log_enabled;
+
+/* The layers' listings.  They print through their own seq_file, so calling them on ours gives the
+ * same bytes the old nodes return - no second formatter to keep in sync. */
+extern int sus_path_proc_show(struct seq_file *m, void *v);
+extern int sus_mount_keep_proc_show(struct seq_file *m, void *v);
+extern int hide_modules_proc_show(struct seq_file *m, void *v);
+extern int kstat_proc_show(struct seq_file *m, void *v);
+extern int avc_proc_show(struct seq_file *m, void *v);
+extern int opath_proc_show(struct seq_file *m, void *v);
+extern int or_proc_show(struct seq_file *m, void *v);
+extern int susfs_unload_show(struct seq_file *m, void *v);
+extern int log_proc_show(struct seq_file *m, void *v);
+
+#define CTL_SECTION(m, name, fn)	\
+	do {				\
+		seq_printf((m), "\n== %s ==\n", (name));	\
+		(fn)((m), NULL);	\
+	} while (0)
+
+static int susfs_ctl_show(struct seq_file *m, void *v)
+{
+	seq_puts(m, "susfs: one node, namespaced commands\n"
+		     "  sus_path add|del <path> | clear\n"
+		     "  sus_mount add|del <prefix> | set <p1,p2> | reset | clear\n"
+		     "  hide_modules reset|clear|<name>|list\n"
+		     "  sufs expose <view> <real> | del <view>\n"
+		     "  log 0|1\n"
+		     "  unload 1\n");
+
+	CTL_SECTION(m, "sus_path", sus_path_proc_show);
+	CTL_SECTION(m, "sus_mount", sus_mount_keep_proc_show);
+	CTL_SECTION(m, "hide_modules", hide_modules_proc_show);
+	CTL_SECTION(m, "kstat", kstat_proc_show);
+	CTL_SECTION(m, "avc_spoof", avc_proc_show);
+	CTL_SECTION(m, "opath", opath_proc_show);
+	CTL_SECTION(m, "open_redirect", or_proc_show);
+	CTL_SECTION(m, "log", log_proc_show);
+	CTL_SECTION(m, "unload", susfs_unload_show);
+	return 0;
+}
 
 /* Split off the first word; returns the rest (never NULL) and terminates the first word. */
 static char *ctl_take_word(char *s)
@@ -85,15 +125,32 @@ static ssize_t susfs_ctl_write(struct file *file, const char __user *buf, size_t
 		rc = sus_mount_keep_command(rest, false);
 	} else if (!strcmp(ns, "hide_modules")) {
 		rc = hide_modules_command(rest, false);
+	} else if (!strcmp(ns, "log")) {
+		if (!strcmp(rest, "1")) {
+			WRITE_ONCE(log_enabled, true);
+			rc = 0;
+		} else if (!strcmp(rest, "0")) {
+			WRITE_ONCE(log_enabled, false);
+			rc = 0;
+		} else {
+			rc = -EINVAL;
+		}
+	} else if (!strcmp(ns, "unload")) {
+		rc = !strcmp(rest, "1") ? susfs_unload_request() : -EINVAL;
 	} else if (!strcmp(ns, "sufs")) {
-		char *view = rest, *real = ctl_take_word(rest);
+		char *verb = rest, *args = ctl_take_word(rest);
 
-		if (!strcmp(view, "expose")) {
-			char *vp = real, *rp = ctl_take_word(real);
+		if (!strcmp(verb, "expose")) {
+			char *vp = args, *rp = ctl_take_word(args);
 
 			rc = (*vp && *rp) ? susfs_open_redirect_add_view_rule(vp, rp) : -EINVAL;
-		} else if (!strcmp(view, "del")) {
-			rc = *real ? (susfs_open_redirect_del_view_rule(real), 0) : -EINVAL;
+		} else if (!strcmp(verb, "del")) {
+			if (*args) {
+				susfs_open_redirect_del_view_rule(args);
+				rc = 0;
+			} else {
+				rc = -EINVAL;
+			}
 		} else {
 			rc = -EINVAL;
 		}
@@ -108,30 +165,18 @@ static ssize_t susfs_ctl_write(struct file *file, const char __user *buf, size_t
 	return len;
 }
 
-static ssize_t susfs_ctl_read(struct file *file, char __user *ubuf, size_t len, loff_t *pos)
-{
-	static const char banner[] =
-		"susfs: one node, namespaced commands\n"
-		"  sus_path add|del <path> | clear\n"
-		"  sus_mount add|del <prefix> | set <p1,p2> | reset | clear\n"
-		"  hide_modules reset|clear|<name>|list\n"
-		"  sufs expose <view> <real> | del <view>\n";
-
-	if (*pos)
-		return 0;
-	return simple_read_from_buffer(ubuf, len, pos, banner, sizeof(banner) - 1);
-}
-
 static int susfs_ctl_open(struct inode *inode, struct file *file)
 {
 	if (current_uid().val != 0)
 		return -ENOENT;
-	return 0;
+	return single_open(file, susfs_ctl_show, NULL);
 }
 
 static const struct proc_ops susfs_ctl_pops = {
 	.proc_open	= susfs_ctl_open,
-	.proc_read	= susfs_ctl_read,
+	.proc_read	= seq_read,
+	.proc_lseek	= seq_lseek,
+	.proc_release	= single_release,
 	.proc_write	= susfs_ctl_write,
 };
 

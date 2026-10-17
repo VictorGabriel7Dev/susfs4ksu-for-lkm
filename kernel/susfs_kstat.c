@@ -2085,7 +2085,7 @@ out:
 }
 
 /* ---- /proc/susfs_kstat: runtime rule management ---- */
-static int kstat_proc_show(struct seq_file *m, void *v);
+int kstat_proc_show(struct seq_file *m, void *v);
 static int kstat_proc_open(struct inode *inode, struct file *file);
 static ssize_t kstat_proc_write(struct file *file, const char __user *buf,
                                 size_t len, loff_t *off);
@@ -2191,7 +2191,7 @@ void susfs_kstat_exit(void)
 	kstat_table_clear();
 }
 
-static int kstat_proc_show(struct seq_file *m, void *v)
+int kstat_proc_show(struct seq_file *m, void *v)
 {
 	int i;
 

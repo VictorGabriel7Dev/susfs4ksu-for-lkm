@@ -444,7 +444,7 @@ static const struct kernel_param_ops hide_modules_ops = {
 /* 0600: root reads and writes it, and the whole directory is inside the one the hide_modules feature hides from everyone. */
 module_param_cb(hide_modules, &hide_modules_ops, NULL, 0600);
 
-static int hide_modules_proc_show(struct seq_file *m, void *v)
+int hide_modules_proc_show(struct seq_file *m, void *v)
 {
 	char buf[512];
 

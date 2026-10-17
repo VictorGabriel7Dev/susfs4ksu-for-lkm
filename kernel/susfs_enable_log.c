@@ -28,7 +28,7 @@ bool susfs_log_enabled(void)
 /* Deliberately NOT EXPORT_SYMBOL'd: the only user is this module (susfs_log.h wraps it), and an exported name
  * shows up as a [susfs_guard_lkm]-owned symbol in /proc/kallsyms - outward surface upstream SUSFS lacks. */
 
-static int log_proc_show(struct seq_file *m, void *v)
+int log_proc_show(struct seq_file *m, void *v)
 {
 	seq_printf(m, "%d\n", log_enabled ? 1 : 0);
 	return 0;

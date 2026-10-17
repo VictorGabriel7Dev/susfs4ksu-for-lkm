@@ -2085,7 +2085,7 @@ static int sus_path_show_list(char *buf, const struct kernel_param *kp)
  * and registered in the self-protected set so everyone else gets ENOENT. */
 static struct proc_dir_entry *sus_path_node_entry;
 
-static int sus_path_proc_show(struct seq_file *m, void *v)
+int sus_path_proc_show(struct seq_file *m, void *v)
 {
     char *buf = kvmalloc(PAGE_SIZE, GFP_KERNEL);
     int n;
