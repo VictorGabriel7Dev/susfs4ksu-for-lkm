@@ -24,9 +24,12 @@
  * another tracer is present - every process), and the bit is inherited across fork with nothing
  * clearing it.  It answers "will KernelSU's hook run for this task", not "does KernelSU trust it". */
 
-/* Set once by the init below: true = KernelSU's symbol was not found, and the strict fallback
- * (uid 0 only) is in force.  Read by callers, never recomputed. */
-extern bool susfs_ksu_allow_gate_off;
+/* WHICH allow source is in force.  0 = none found (the strict fallback, uid 0 only),
+ * 1 = KernelSU's __ksu_is_allow_uid_for_current.  This is the extension point: a second source -
+ * another root solution's predicate, or an extra local rule - becomes case 2 in
+ * susfs_ksu_allow_ask() without touching a single caller, because callers only ever see
+ * susfs_ksu_allow_uid()/susfs_ksu_allow_current().  Set once by the init, read by everybody. */
+extern int susfs_ksu_allow_kind;
 
 /* The one indirect call, through the address resolved at load. */
 bool susfs_ksu_allow_ask(uid_t uid);
@@ -36,8 +39,8 @@ bool susfs_ksu_allow_ask(uid_t uid);
  * privileged view stops being visible to su) instead of leaking it to apps. */
 static inline bool susfs_ksu_allow_uid(uid_t uid)
 {
-	if (READ_ONCE(susfs_ksu_allow_gate_off))
-		return uid == 0;
+	if (READ_ONCE(susfs_ksu_allow_kind) == 0)
+		return uid == 0;	/* nothing resolved: the strict answer, by design */
 
 	return susfs_ksu_allow_ask(uid);
 }

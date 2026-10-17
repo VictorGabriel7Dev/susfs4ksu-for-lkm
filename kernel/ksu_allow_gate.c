@@ -27,17 +27,30 @@ static const char *const ksu_allow_symbols[] = {
 };
 
 /* Written once in init, read by every caller through susfs_ksu_allow_current().  Non-NULL exactly
- * while susfs_ksu_allow_gate_off == false, which is what lets the inline above test the flag
- * instead of the pointer on every call. */
+ * while susfs_ksu_allow_kind == 1, which is what lets the inline above test the kind instead of the
+ * pointer on every call. */
 static bool (*ksu_allow_fn)(uid_t uid);
 
-bool susfs_ksu_allow_gate_off = true;
+/* 0 = no source resolved (strict fallback), 1 = KernelSU's predicate.  See the header. */
+int susfs_ksu_allow_kind;
 
 /* noinline __nocfi: an indirect call through a resolved address.  CFI checks indirect call sites,
- * and LTO would otherwise inline a small static helper back into a caller that is not marked. */
+ * and LTO would otherwise inline a small static helper back into a caller that is not marked.
+ *
+ * The switch is the extension point, and it is deliberately a switch on a kind rather than a chain
+ * of ifs: adding a second allow source (another root solution, a local rule table) means adding a
+ * case here and setting the kind in init - no caller changes, and the strict default stays put for
+ * every kind nobody implemented. */
 bool __nocfi noinline susfs_ksu_allow_ask(uid_t uid)
 {
-	return ksu_allow_fn(uid);
+	switch (READ_ONCE(susfs_ksu_allow_kind)) {
+	case 1:
+		return ksu_allow_fn(uid);
+	default:
+		/* Unreachable while the flag above says a source exists; the strict answer is the safe
+		 * one if the kind ever changes under a caller. */
+		return uid == 0;
+	}
 }
 
 int susfs_ksu_allow_gate_init(void)
@@ -55,7 +68,7 @@ int susfs_ksu_allow_gate_init(void)
 	}
 
 	if (!addr) {
-		susfs_ksu_allow_gate_off = true;
+		WRITE_ONCE(susfs_ksu_allow_kind, 0);
 		/* pr_warn, not SUSFS_LOGI: "the allowlist predicate is not in effect on this device"
 		 * is something an operator has to be able to see from the load alone. */
 		pr_warn("susfs_guard_lkm: neither %s nor %s is in kallsyms - the privileged-view predicate falls back to uid == 0, so a su-granted app and the manager app are NOT covered here.\n",
@@ -64,7 +77,7 @@ int susfs_ksu_allow_gate_init(void)
 	}
 
 	ksu_allow_fn = (bool (*)(uid_t))addr;
-	susfs_ksu_allow_gate_off = false;	/* only now is there something to ask */
+	WRITE_ONCE(susfs_ksu_allow_kind, 1);	/* only now is there something to ask */
 	SUSFS_LOGI("ksu_allow_gate: resolved %s at %px - the privileged-view predicate now answers KernelSU\n",
 		   used, (void *)addr);
 	return 0;
