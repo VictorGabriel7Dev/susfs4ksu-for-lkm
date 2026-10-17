@@ -181,7 +181,7 @@ static void hide_modules_commit(char dst[][MODULE_NAME_LEN], int n)
  * build - "ld.lld: warning: stack frame size (3024) exceeds limit (2048) in function 'hide_modules_command'", and
  * 5.15/android14-5.15 as "susfs_hide_syms.c:197:0: stack frame size (3024) exceeds limit (2048)".  6.x turns that warning
  * into an error.  Both callers are proc/module_param setters - process context - so GFP_KERNEL is fine. */
-static int hide_modules_command(const char *val, bool bare_list)
+int hide_modules_command(const char *val, bool bare_list)
 {
 	char *cmd;
 	char (*staged)[MODULE_NAME_LEN];

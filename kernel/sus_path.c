@@ -1878,7 +1878,7 @@ static bool sus_path_path_is_ours(const char *path)
     return ours;
 }
 
-static int sus_path_command(const char *val, int *removed_out)
+int sus_path_command(const char *val, int *removed_out)
 {
     char cmd[SUS_PATH_LEN + 16];
     const char *arg;

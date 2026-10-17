@@ -18,6 +18,7 @@
 #include "lsm_hook.h"
 #include "susfs.h"
 #include "susfs_opath.h"	/* SUSFS_OPATH_NODE + the layer's init/exit */
+#include "susfs_ctl.h"	/* /proc/susfs: the unified, namespaced control node */
 #include "sufs_fs.h"		/* the privileged view's own filesystem (privfs) */
 
 /* The module's own name lives in susfs.h (SUSFS_LKM_MODULE_NAME / SUSFS_LKM_SYSFS_DIR):
@@ -51,6 +52,8 @@ static const char *const susfs_self_hide_paths[] = {
     /* sus_path's own interface (the rule listing): it goes through the same table it
      * prints, so a broken rule table is visible in the very view that reports it. */
     SUSFS_PATH_NODE,
+    /* the unified control node (namespaced commands) */
+    "/proc/susfs",
     /* the view's command surface: same rule as the node above */
     /* The O_PATH layer's node: it reports the four sys_call_table/compat_sys_call_table
      * entries and the counters that say whether a wrapper ever ran. */
@@ -146,6 +149,9 @@ static struct {
     /* Last, so teardown takes it down first.  This node exists to make the module leave (detach
      * the view, then ask userspace for rmmod); keeping it armed after everything else has been
      * taken apart would only offer a half-working exit. */
+    /* One control node, namespaced commands: /proc/susfs.  The per-layer nodes it replaces
+     * stay in place until their commands have moved, so nothing breaks in between. */
+    { "susfs_ctl",	susfs_ctl_init,		susfs_ctl_exit,	false, false },
     { "unload",		susfs_unload_init,		susfs_unload_exit,	false, false },
 };
 

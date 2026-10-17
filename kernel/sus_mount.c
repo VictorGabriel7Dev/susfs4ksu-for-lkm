@@ -1718,7 +1718,7 @@ static void sus_mount_keep_rescan(void)
  * error in the 6.6 GKI build.  They are kvmalloc'd instead: every caller here is a proc/sysfs
  * write handler or module_param setter, i.e. process context that may sleep, so GFP_KERNEL is
  * safe.  The command semantics are unchanged - the early returns now go through @out. */
-static int sus_mount_keep_command(const char *val, bool bare_list)
+int sus_mount_keep_command(const char *val, bool bare_list)
 {
 	char *cmd;
 	char (*staged)[SUS_MOUNT_KEEP_LEN];
