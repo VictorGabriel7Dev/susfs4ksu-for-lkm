@@ -14,7 +14,7 @@
 #include "susfs_log.h"
 #include "susfs.h"	/* susfs_expose_proc */
 
-static bool log_enabled = true;
+bool log_enabled = true;	/* non-static: the unified control node writes it as the "log" namespace */
 
 /* Load-time switch, read-only in sysfs; the runtime switch is the /proc node and the supercall, the interfaces
  * upstream's userspace drives (ksud insmod ... enable_log=0).  A load that starts silent is the only state in
