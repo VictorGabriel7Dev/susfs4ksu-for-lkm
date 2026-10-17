@@ -120,6 +120,13 @@ static ssize_t susfs_ctl_write(struct file *file, const char __user *buf, size_t
 	while (len && (cmd[len - 1] == '\n' || cmd[len - 1] == '\r'))
 		cmd[--len] = '\0';
 
+	/* An empty command is a no-op SUCCESS, not an error: the shell's echo writes the text and the
+	 * newline as two separate write() calls, so the second one arrives here as a lone newline.  A
+	 * first attempt that answered -EINVAL here made every 'echo ... > /proc/susfs' report failure
+	 * even when the command had already been applied. */
+	if (!len)
+		return 0;
+
 	ns = cmd;
 	rest = ctl_take_word(cmd);
 
