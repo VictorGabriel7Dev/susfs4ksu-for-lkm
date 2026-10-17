@@ -55,7 +55,8 @@
 #include <linux/security.h>	/* security_secctx_to_secid */
 #include "susfs_abi.h"
 #include "susfs_log.h"
-#include "susfs.h"		/* susfs_expose_proc, sus_path_lsm_active */
+#include "susfs.h"
+#include "sufs_router.h"	/* the view jump table */		/* susfs_expose_proc, sus_path_lsm_active */
 #include "symbol_resolver.h"	/* find_kernel_symbol_exact */
 #include "ksu_umount_gate.h"	/* susfs_is_current_proc_umounted_app (issue #34) */
 #include "susfs_kprobe.h"
