@@ -2338,8 +2338,7 @@ static ssize_t kstat_proc_write(struct file *file, const char __user *buf,
 
 	err = kstat_command(cmd);
 	if (err) {
-		pr_warn("kstat proc write failed %d
-", err);
+		pr_warn("kstat proc write failed %d\n", err);
 		return err;
 	}
 	return len;
