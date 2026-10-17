@@ -135,6 +135,7 @@ static struct {
      * hide yet.  NOT fatal, and a no-op without privfs=1: the privileged view is an addition,
      * never a condition for the module to work. */
     { "sufs_fs",	sufs_fs_init,			sufs_fs_exit,		false, false },
+    /* The view's proc command surface: /proc/susfs_view.  Non-fatal: without it the commands are
      * unreachable, and nothing else depends on them. */
     { "cmdline",	susfs_spoof_cmdline_init,	susfs_spoof_cmdline_exit, false, false },
     { "open_redirect",	susfs_open_redirect_init,	susfs_open_redirect_exit, false, false },
