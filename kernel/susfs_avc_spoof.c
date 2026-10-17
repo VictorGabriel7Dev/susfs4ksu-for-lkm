@@ -164,6 +164,24 @@ static int avc_proc_open(struct inode *inode, struct file *file)
 	return single_open(file, avc_proc_show, NULL);
 }
 
+/* The switch itself, so the unified control node can expose it as the "avc" namespace. */
+int avc_spoof_set(int on)
+{
+	int rc = 0;
+
+	if (on) {
+		if (!avc_spoof_enabled) {
+			rc = avc_register();
+			if (!rc)
+				avc_spoof_enabled = true;
+		}
+	} else {
+		avc_unregister();
+		avc_spoof_enabled = false;
+	}
+	return rc;
+}
+
 static ssize_t avc_proc_write(struct file *file, const char __user *buf,
 			      size_t len, loff_t *off)
 {

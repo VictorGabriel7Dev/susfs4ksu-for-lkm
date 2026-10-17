@@ -43,6 +43,8 @@ extern int sus_path_command(const char *val, int *removed_out);
 extern int sus_mount_keep_command(const char *val, bool bare_list);
 extern int hide_modules_command(const char *val, bool bare_list);
 extern int susfs_unload_request(void);
+extern int kstat_command(char *cmd);
+extern int avc_spoof_set(int on);
 extern bool log_enabled;
 
 /* The layers' listings.  They print through their own seq_file, so calling them on ours gives the
@@ -71,6 +73,8 @@ static int susfs_ctl_show(struct seq_file *m, void *v)
 		     "  hide_modules reset|clear|<name>|list\n"
 		     "  sufs expose <view> <real> | del <view>\n"
 		     "  log 0|1\n"
+		     "  kstat add_sus_kstat <path> | update_sus_kstat <path> | del <path> | clear\n"
+		     "  avc 0|1\n"
 		     "  unload 1\n");
 
 	CTL_SECTION(m, "sus_path", sus_path_proc_show);
@@ -135,6 +139,11 @@ static ssize_t susfs_ctl_write(struct file *file, const char __user *buf, size_t
 		} else {
 			rc = -EINVAL;
 		}
+	} else if (!strcmp(ns, "kstat")) {
+		rc = kstat_command(rest);
+	} else if (!strcmp(ns, "avc")) {
+		rc = !strcmp(rest, "1") ? avc_spoof_set(1) :
+		     !strcmp(rest, "0") ? avc_spoof_set(0) : -EINVAL;
 	} else if (!strcmp(ns, "unload")) {
 		rc = !strcmp(rest, "1") ? susfs_unload_request() : -EINVAL;
 	} else if (!strcmp(ns, "sufs")) {

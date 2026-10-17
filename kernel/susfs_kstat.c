@@ -2285,27 +2285,16 @@ static int split_ws(char *buf, char **argv, int max)
 	return argc;
 }
 
-static ssize_t kstat_proc_write(struct file *file, const char __user *buf,
-                                size_t len, loff_t *off)
+/* The command body, without file/user buffer, so the unified control node can expose it as
+ * the "kstat" namespace without a second copy of the grammar.  cmd is modified in place. */
+int kstat_command(char *cmd)
 {
-	char cmd[768];
 	char *argv[16];
 	int argc, err;
 
-	/* Same gate as kstat_proc_open(): open() alone is not enough - an fd opened by root and
-	 * handed on would keep working, which is why the sibling files check both. */
-	if (current_uid().val != 0)
-		return -ENOENT;
-
-	if (len >= sizeof(cmd))
-		len = sizeof(cmd) - 1;
-	if (copy_from_user(cmd, buf, len))
-		return -EFAULT;
-	cmd[len] = 0;
-
 	argc = split_ws(cmd, argv, 16);
 	if (argc == 0)
-		return len;
+		return 0;
 
 	mutex_lock(&kstat_lock);
 	err = -EINVAL;
@@ -2327,15 +2316,30 @@ static ssize_t kstat_proc_write(struct file *file, const char __user *buf,
 	}
 
 	mutex_unlock(&kstat_lock);
+	return err;
+}
 
-	if (!err)
-		kstat_maps_arm();
+static ssize_t kstat_proc_write(struct file *file, const char __user *buf,
+                                size_t len, loff_t *off)
+{
+	char cmd[768];
+	int err;
 
+	/* Same gate as kstat_proc_open(): open() alone is not enough - an fd opened by root and
+	 * handed on would keep working, which is why the sibling files check both. */
+	if (current_uid().val != 0)
+		return -ENOENT;
+
+	if (len >= sizeof(cmd))
+		len = sizeof(cmd) - 1;
+	if (copy_from_user(cmd, buf, len))
+		return -EFAULT;
+	cmd[len] = 0;
+
+	err = kstat_command(cmd);
 	if (err) {
-		pr_warn("kstat proc write '%s' -> err %d\n", argv[0], err);
-		/* Reported to the writer: a command that did not take effect must not look like a
-		 * successful full write.  Success still returns len, so callers that expect a complete
-		 * write keep working. */
+		pr_warn("kstat proc write failed %d
+", err);
 		return err;
 	}
 	return len;
