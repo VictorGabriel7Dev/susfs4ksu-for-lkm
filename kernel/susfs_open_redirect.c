@@ -1093,6 +1093,17 @@ static int or_proc_show(struct seq_file *m, void *v)
 	/* "registered" is not "reached": a hook whose counter stays 0 across a real read means GKI inlined its call sites
 	 * and that surface is NOT disguised - hence the counters below (fdinfo's surface and provenance are in the face-4
 	 * block above).  mnt_id is NOT rewritten here: that id belongs to sus_mount's table. */
+	{
+		char *rb = kvmalloc(PAGE_SIZE, GFP_KERNEL);
+
+		if (rb) {
+			int rn = susfs_router_format(rb, PAGE_SIZE);
+
+			if (rn > 0)
+				seq_write(m, rb, (size_t)rn);
+			kvfree(rb);
+		}
+	}
 	seq_printf(m, "hooks: forward=%d dpath=%d statfs=%d maps=%d fdinfo=%d | rev hits: dpath=%d statfs=%d maps=%d/%d/%d fdinfo=%d/%d | su_sid=%u\n",
 		   susfs_or_entry_armed(), or_dpath_registered, or_statfs_registered,
 		   or_maps_registered, n_or_fdinfo_probes > 0,
