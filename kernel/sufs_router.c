@@ -8,8 +8,10 @@
  *
  *   - sufs_router_match_path()   the open entry (kernel/susfs_or_entry.c), which already resolved
  *                                the path, so the key falls out of path->dentry->d_parent + d_name
- *   - sufs_router_has_name()     the dirent layer, which must not emit the name for a caller the
- *                                predicate rejects (and does emit it for one it accepts)
+ *   - sufs_router_has_name()     the dirent layer: wired for the hiding direction (a rejected
+ *                                caller does not see the name in a listing); the injecting
+ *                                direction - an accepted caller sees a name only the table carries
+ *                                - belongs to the isolated shape and is not wired yet
  *   - sufs_router_format()       the status listing
  *
  * There is deliberately no filesystem here: the table is the view, and nothing has to be mounted,
@@ -112,6 +114,10 @@ bool sufs_router_match_path(const struct path *path, char *buf, size_t buflen)
 			continue;
 		if (r->pino != pino_inode->i_ino)
 			continue;
+		/* Same inode number on a different filesystem is a different directory; the key is
+		 * (superblock, inode, name), and pdev is the superblock half. */
+		if (r->pdev != pino_inode->i_sb->s_dev)
+			continue;
 		if (strlen(r->name) != d->d_name.len ||
 		    memcmp(r->name, d->d_name.name, d->d_name.len))
 			continue;
@@ -148,6 +154,8 @@ bool sufs_router_has_name(const struct inode *dir, const char *name, size_t len)
 		if (!READ_ONCE(r->live))
 			continue;
 		if (r->pino != dir->i_ino)
+			continue;
+		if (r->pdev != dir->i_sb->s_dev)
 			continue;
 		if (strlen(r->name) != len || memcmp(r->name, name, len))
 			continue;
@@ -261,11 +269,17 @@ void sufs_router_del(const char *view_path)
 
 int susfs_router_format(char *buf, size_t size)
 {
-	int i, n = 0;
+	int i, n = 0, nroutes = 0;
 
+	/* live slots only: sufs_nroutes is the scan bound and only grows (a removed slot is never
+	 * reused), so printing it said "1 route(s)" after the one route had been deleted. */
+	for (i = 0; i < sufs_nroutes; i++) {
+		if (READ_ONCE(sufs_routes[i].live))
+			nroutes++;
+	}
 	n += scnprintf(buf + n, size - n,
 		       "sufs_router: %d route(s), hits=%d, misses=%d, last miss %lu/%s\n",
-		       sufs_nroutes, atomic_read(&sufs_router_hits),
+		       nroutes, atomic_read(&sufs_router_hits),
 		       atomic_read(&sufs_router_misses),
 		       sufs_router_last_pino, sufs_router_last_name);
 	for (i = 0; i < sufs_nroutes && (size_t)n < size; i++) {
