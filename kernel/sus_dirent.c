@@ -43,6 +43,8 @@
 #include "susfs.h"
 #include "susfs_log.h"
 #include "symbol_resolver.h"
+#include "sufs_router.h"	/* the view's jump table: a routed name is not listed to apps */
+#include "ksu_allow_gate.h"	/* who the view is for - asked once per getdents call */
 
 /* 6.1 turned filldir_t's "keep going" from 0 into true. */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
@@ -77,6 +79,10 @@ struct sd_buf {
 	int				count;
 	int				error;
 	bool				compat;
+	/* The view: buf.dir is the directory being listed, and hide_routes says the caller is one
+	 * the predicate rejected - routed names must not appear in its listing at all. */
+	struct inode			*dir;
+	bool				hide_routes;
 };
 
 static int (*sd_iterate_dir)(struct file *, struct dir_context *);
@@ -88,6 +94,7 @@ module_param(prefilter, bool, 0644);
 
 static atomic_t n_sd_calls = ATOMIC_INIT(0);
 static atomic_t n_sd_hidden = ATOMIC_INIT(0);
+static atomic_t n_sd_routes_hidden = ATOMIC_INIT(0);
 
 /* fs/readdir.c's verify_dirent_name(), which is static there - both halves of it: the length bound
  * is the one this used to drop, and the kernel applies the whole check before it writes anything,
@@ -123,6 +130,17 @@ static SD_RET sd_filldir(struct dir_context *ctx, const char *name, int namlen,
 			atomic_inc(&n_sd_hidden);
 			return SD_GO;
 		}
+	}
+
+	/* The view's own hiding, separate from sus_path's table: a routed name is not among the
+	 * entries this directory has, for a caller the predicate rejected.  hide_routes was decided
+	 * once in the entry point, so an app's listing pays one predicate call in total rather than
+	 * one per name.  The (pointer, length) pair is passed as handed over - the comparison is
+	 * memcmp() over namlen, so no NUL is needed on either side. */
+	if (buf->hide_routes && buf->dir &&
+	    sufs_router_has_name(buf->dir, name, (size_t)namlen)) {
+		atomic_inc(&n_sd_routes_hidden);
+		return SD_GO;
 	}
 
 	if (!sd_name_ok(name, namlen)) {
@@ -230,6 +248,14 @@ __nocfi bool susfs_dirent_prefilter(const struct pt_regs *regs, long *out,
 		return true;
 	}
 
+	/* The view's key: the directory this listing is of, and whether this caller is one the
+	 * predicate rejects.  sufs_router_active() first so that, with an empty table, an app's
+	 * getdents never asks KernelSU anything at all.  The predicate is asked once per call on
+	 * purpose (see the cheap-static-cost note in ksu_allow_gate.h). */
+	if (f->f_path.dentry)
+		buf.dir = d_inode(f->f_path.dentry);
+	buf.hide_routes = sufs_router_active() && !susfs_ksu_allow_current();
+
 	/* What fdget_pos() does for the real syscall.  Without it two threads reading one
 	 * shared fd both start from the same f_pos and the listing repeats itself - measured
 	 * at 414 duplicates in 846 records before this was here.  The kernel only takes the
@@ -285,6 +311,7 @@ int susfs_sus_dirent_init(void)
 void susfs_sus_dirent_exit(void)
 {
 	sd_armed = false;
-	SUSFS_LOGI("sus_dirent: calls=%d hidden=%d\n",
-		   atomic_read(&n_sd_calls), atomic_read(&n_sd_hidden));
+	SUSFS_LOGI("sus_dirent: calls=%d hidden=%d view_hidden=%d\n",
+		   atomic_read(&n_sd_calls), atomic_read(&n_sd_hidden),
+		   atomic_read(&n_sd_routes_hidden));
 }
