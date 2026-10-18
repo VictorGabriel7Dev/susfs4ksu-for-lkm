@@ -36,6 +36,7 @@
 #include <linux/mutex.h>
 #include <linux/uaccess.h>
 #include <linux/sched/signal.h>
+#include <linux/slab.h>		/* kmalloc_array: the injected records are collected first */
 #include <linux/string.h>
 #include <linux/limits.h>	/* NAME_MAX/PATH_MAX: the name a filldir callback hands over */
 #include <asm/ptrace.h>
@@ -83,6 +84,9 @@ struct sd_buf {
 	 * the predicate rejected - routed names must not appear in its listing at all. */
 	struct inode			*dir;
 	bool				hide_routes;
+	/* The other direction: this caller is accepted, so the routed names that are not on disk
+	 * are added to the listing once the real directory has been read to its end. */
+	bool				inject;
 };
 
 static int (*sd_iterate_dir)(struct file *, struct dir_context *);
@@ -207,6 +211,37 @@ static SD_RET sd_filldir(struct dir_context *ctx, const char *name, int namlen,
 	return SD_GO;
 }
 
+/* The injecting side: a caller the predicate accepts also sees the routed names that the
+ * filesystem does not have (the isolated shape leaves them absent on disk).  Records are shaped
+ * like the target - its inode number and type - so a listing reads them as the file they stand
+ * for.  The positions live at the top of the loff_t range, which is also the marker: f_pos past
+ * SD_ROUTE_POS_BASE means "the virtual entries were already handed over", and the entry point
+ * answers such a position with EOF instead of adding them a second time. */
+#define SD_ROUTE_POS_BASE	(1LL << 62)
+
+static void sd_emit_routes(struct sd_buf *buf, struct file *f)
+{
+	struct sufs_route_desc *routes;
+	int i, nr, emitted = 0;
+
+	routes = kmalloc_array(SUFS_ROUTE_MAX, sizeof(*routes), GFP_KERNEL);
+	if (!routes)
+		return;
+	nr = sufs_router_collect_dir(buf->dir, routes, SUFS_ROUTE_MAX);
+	for (i = 0; i < nr; i++) {
+		loff_t off = SD_ROUTE_POS_BASE + emitted;
+
+		if (sd_filldir(&buf->ctx, routes[i].name,
+			       (int)strlen(routes[i].name), off, routes[i].ino,
+			       routes[i].d_type) == SD_STOP)
+			break;
+		emitted++;
+	}
+	kfree(routes);
+	if (emitted)
+		f->f_pos = SD_ROUTE_POS_BASE + emitted;
+}
+
 /*
  * fs/readdir.c's getdents/getdents64 implementation with sd_filldir in place of filldir64
  * or compat_filldir.
@@ -221,6 +256,7 @@ __nocfi bool susfs_dirent_prefilter(const struct pt_regs *regs, long *out,
 	struct sd_buf buf = {};
 	bool pos_locked = false;
 	struct file *f;
+	long dir_ret;
 	long error;
 
 	if (!READ_ONCE(prefilter) || !sd_armed || !sd_iterate_dir || !sd_fget)
@@ -255,6 +291,9 @@ __nocfi bool susfs_dirent_prefilter(const struct pt_regs *regs, long *out,
 	if (f->f_path.dentry)
 		buf.dir = d_inode(f->f_path.dentry);
 	buf.hide_routes = sufs_router_active() && !susfs_ksu_allow_current();
+	/* The other direction: hide_routes false while the table is active means the predicate
+	 * accepted this caller, so the routed names that exist only in the table are added. */
+	buf.inject = sufs_router_active() && !buf.hide_routes && buf.dir;
 
 	/* What fdget_pos() does for the real syscall.  Without it two threads reading one
 	 * shared fd both start from the same f_pos and the listing repeats itself - measured
@@ -266,9 +305,25 @@ __nocfi bool susfs_dirent_prefilter(const struct pt_regs *regs, long *out,
 		pos_locked = true;
 	}
 
-	error = sd_iterate_dir(f, &buf.ctx);
+	/* Past the marker: the only records that live up there were handed over already. */
+	if (buf.inject && f->f_pos >= SD_ROUTE_POS_BASE) {
+		if (pos_locked)
+			mutex_unlock(&f->f_pos_lock);
+		fput(f);
+		*out = 0;
+		return true;
+	}
+
+	dir_ret = sd_iterate_dir(f, &buf.ctx);
+	error = dir_ret;
 	if (error >= 0)
 		error = buf.error;
+
+	/* The directory was read to its end (nothing stopped the actor): the virtual entries go out
+	 * now, in the same answer.  A buffer that filled up mid-directory leaves them for the call
+	 * that does reach the end - which is why dir_ret is tested as well as buf.error. */
+	if (buf.inject && dir_ret == 0 && buf.error == 0)
+		sd_emit_routes(&buf, f);
 	if (buf.prev_reclen) {
 		void __user *last = (void __user *)buf.current_dir - buf.prev_reclen;
 		int tail_error;

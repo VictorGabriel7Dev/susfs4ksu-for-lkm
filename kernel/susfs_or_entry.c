@@ -58,6 +58,8 @@
 #include <linux/err.h>
 #include <linux/atomic.h>
 #include <linux/limits.h>
+#include <linux/slab.h>		/* kstrdup/kmemdup_nul for the missing-name path */
+#include <linux/string.h>	/* strrchr/strcmp on the caller's path string */
 #include "susfs.h"
 #include "sufs_router.h"	/* the jump table (parent inode, name) -> target */
 #include "susfs_log.h"
@@ -145,6 +147,9 @@ static void (*or_fd_install_fn)(unsigned int fd, struct file *file);
 static void (*or_put_unused_fd_fn)(unsigned int fd);
 static void (*or_fsnotify_open_fn)(struct file *file);
 static int (*or_check_zeroed_user_fn)(const void __user *from, unsigned long count);
+/* getname_kernel(): the parent directory of a name that does not exist is prepared as a kernel
+ * string and resolved from the same dfd, which is how the isolated shape finds its route. */
+static struct filename *(*or_getname_kernel_fn)(const char *name);
 
 static bool or_entry_ready;
 static atomic_t or_entry_hits = ATOMIC_INIT(0);
@@ -180,6 +185,55 @@ static __nocfi noinline int or_check_zeroed_user(const void __user *from, unsign
 static __nocfi noinline void or_put_unused_fd(unsigned int fd)
 {
 	or_put_unused_fd_fn(fd);
+}
+
+/* The isolated shape's redirect: the kernel's own lookup said ENOENT because the name is not in
+ * the directory - for a caller the predicate rejects that is the final answer, and nothing has to
+ * be hidden.  For one it accepts, the route is found by the parent directory plus the last
+ * component, since there is no resolved dentry to take the key from.  The parent is prepared as a
+ * kernel string and resolved from the same dfd, so relative names and dirfds keep their meaning.
+ *
+ * Only reached after a lookup that already failed, so an ordinary open never pays for it.
+ *
+ * __nocfi noinline for the same reason as the other helpers: it calls three runtime-resolved
+ * pointers, and an instrumented indirect call into the kernel is a panic on kCFI kernels. */
+static __nocfi noinline bool or_route_missing(int dfd, const char *pathname,
+					      char *target, size_t buflen)
+{
+	const char *slash, *base;
+	struct filename *dname;
+	struct path dpath;
+	char *dirbuf;
+	bool hit = false;
+
+	if (!or_getname_kernel_fn || !sufs_router_active())
+		return false;
+	slash = strrchr(pathname, '/');
+	if (slash && !slash[1])		/* "dir/" names a directory, never a route */
+		return false;
+	base = slash ? slash + 1 : pathname;
+	if (!*base || !strcmp(base, ".") || !strcmp(base, ".."))
+		return false;
+	if (!slash)
+		dirbuf = kstrdup(".", GFP_KERNEL);
+	else if (slash == pathname)
+		dirbuf = kstrdup("/", GFP_KERNEL);
+	else
+		dirbuf = kmemdup_nul(pathname, (size_t)(slash - pathname), GFP_KERNEL);
+	if (!dirbuf)
+		return false;
+	dname = or_getname_kernel_fn(dirbuf);
+	kfree(dirbuf);
+	if (IS_ERR_OR_NULL(dname))
+		return false;
+	if (!or_filename_lookup_fn(dfd, dname, LOOKUP_DIRECTORY | LOOKUP_FOLLOW,
+				   &dpath, NULL)) {
+		hit = sufs_router_match_parent(d_inode(dpath.dentry), base,
+					       strlen(base), target, buflen);
+		path_put(&dpath);
+	}
+	or_putname_fn(dname);
+	return hit;
 }
 
 /* The original syscall is not called at all when this redirects, so nothing has to be undone if the
@@ -381,9 +435,19 @@ static __nocfi noinline long or_entry_redirect(const struct pt_regs *regs, int k
 	if (IS_ERR(name))
 		return SUSFS_OR_ENTRY_PASS;
 	res = or_filename_lookup_fn(dfd, name, or_lookup_flags(flags, resolve), &path, NULL);
-	or_putname_fn(name);
-	if (res)
-		return SUSFS_OR_ENTRY_PASS;
+	if (res) {
+		/* The name does not resolve - the isolated shape's normal case.  It redirects only
+		 * for a caller the predicate accepts, and then the route is found by the parent
+		 * directory and the last component; everyone else gets the kernel's own ENOENT, which
+		 * is the point: for them the name really is not there. */
+		bool routed = (res == -ENOENT) &&
+			      or_route_missing(dfd, name->name, target, sizeof(target));
+
+		or_putname_fn(name);
+		if (!routed)
+			return SUSFS_OR_ENTRY_PASS;
+		goto have_target;
+	}
 
 	/* The target name is copied out of the rule while the lookup holds rcu_read_lock (rule slots are
 	 * recycled after a grace period, so nothing inside an entry may be used after this call). */
@@ -392,9 +456,13 @@ static __nocfi noinline long or_entry_redirect(const struct pt_regs *regs, int k
 	if (!sufs_router_match_path(&path, target, sizeof(target)) &&
 	    !susfs_open_redirect_match_path(&path, target, sizeof(target))) {
 		path_put(&path);
+		or_putname_fn(name);
 		return SUSFS_OR_ENTRY_PASS;
 	}
 	path_put(&path);	/* no reference is kept anywhere: the rule owns none either */
+	or_putname_fn(name);
+
+have_target:
 	/* Defensive: an empty name is not a path, and filp_open("") resolves to the caller's own
 	 * working directory, i.e. it would hand out an unrelated fd. */
 	if (!target[0])
@@ -472,6 +540,12 @@ int susfs_or_entry_init(void)
 	or_get_unused_fd_flags_fn = (void *)find_kernel_symbol_exact("get_unused_fd_flags");
 	or_fd_install_fn = (void *)find_kernel_symbol_exact("fd_install");
 	or_put_unused_fd_fn = (void *)find_kernel_symbol_exact("put_unused_fd");
+	/* Optional, and only for the isolated shape: without it a name that is absent on disk is
+	 * not redirected (the parent directory cannot be prepared as a kernel string), while every
+	 * path that does resolve still goes through the jump table. */
+	or_getname_kernel_fn = (void *)find_kernel_symbol_exact("getname_kernel");
+	if (!or_getname_kernel_fn)
+		SUSFS_LOGI("or_entry: getname_kernel not found - an absent view name will not redirect\n");
 	/* Required rather than optional: the descriptor is now taken before the file is opened, and
 	 * without the undo a failed open would leak the descriptor.  Taking the descriptor first is what
 	 * keeps an EMFILE/ENFILE open from having created or truncated the rule's target. */
