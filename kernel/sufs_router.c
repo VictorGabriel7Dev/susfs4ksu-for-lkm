@@ -121,6 +121,12 @@ bool sufs_router_match_path(const struct path *path, char *buf, size_t buflen)
 	return hit;
 }
 
+/* The entry layer's fast path: one load when the table is empty, which is the common case. */
+bool sufs_router_active(void)
+{
+	return READ_ONCE(sufs_nroutes) > 0;
+}
+
 /* For the dirent layer: does this directory carry a routed name at all, and is this one of them? */
 bool sufs_router_has_name(const struct inode *dir, const char *name, size_t len)
 {

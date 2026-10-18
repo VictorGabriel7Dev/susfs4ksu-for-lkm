@@ -214,8 +214,7 @@ static __nocfi noinline long or_entry_redirect(const struct pt_regs *regs, int k
 	/* This hook is reached for every open() on the system, so the empty case has to be one load: no
 	 * live rules means nothing to resolve a name for, and deleting the last rule takes that cost away
 	 * again (susfs_open_redirect_rules counts live rules, not rules ever added). */
-	if (!susfs_open_redirect_active())
-		return SUSFS_OR_ENTRY_PASS;
+	/* Either surface can name a target: the view's jump table (the table is the view) or the	 * older per-inode rules.  Checking only the rules would send every open back to the kernel	 * while 'expose' filled the table instead - measured as hits=0 and misses=0, i.e. this hook	 * never ran. */	if (!susfs_open_redirect_active() && !sufs_router_active())		return SUSFS_OR_ENTRY_PASS;
 
 	/* arm64 keeps a syscall's arguments in regs[0..5] for native and compat alike, so the
 	 * argument number IS the register index (arch/arm64/include/asm/syscall_wrapper.h). */
