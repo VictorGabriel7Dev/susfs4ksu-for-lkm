@@ -49,6 +49,7 @@
 #include "susfs.h"
 #include "sufs_fs.h"
 #include "susfs_log.h"
+#include "ksu_allow_gate.h"	/* susfs_control_visible(): the node gate is su's own */
 
 #define SUSFS_UNLOAD_NODE	"/proc/susfs_unload"
 
@@ -65,7 +66,7 @@ static ssize_t susfs_unload_write(struct file *file, const char __user *buf, siz
 
 	/* Same convention as every other control node: 0777 so DAC never answers for us, and the
 	 * uid check is what actually refuses (an fd opened before privileges were dropped too). */
-	if (current_uid().val != 0)
+	if (!susfs_control_visible())
 		return -ENOENT;
 	if (len == 0 || len >= sizeof(tmp))
 		return -EINVAL;
@@ -101,7 +102,7 @@ static int susfs_unload_show(struct seq_file *m, void *v)
 
 static int susfs_unload_open(struct inode *inode, struct file *file)
 {
-	if (current_uid().val != 0)
+	if (!susfs_control_visible())
 		return -ENOENT;
 	return single_open(file, susfs_unload_show, NULL);
 }

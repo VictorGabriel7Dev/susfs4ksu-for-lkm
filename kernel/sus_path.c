@@ -55,6 +55,7 @@
 #include "susfs.h"	/* susfs_abi_path_ok */
 #include "symbol_resolver.h"	/* find_kernel_symbol_exact, for optional compat probes */
 #include "ksu_umount_gate.h"	/* susfs_is_current_proc_umounted_app (issue #34) */
+#include "ksu_allow_gate.h"	/* susfs_control_visible(): the self-protect gate is su's own */
 
 #include "lsm_hook.h"
 #include "fsnotify_lifetime.h"
@@ -445,7 +446,7 @@ static inline bool sus_path_entry_gate_inode(const struct sus_path_entry *e,
                                              struct inode *inode)
 {
     if (e->self_protect)
-        return current_uid().val != 0;
+        return !susfs_control_visible();
     return sus_path_gate_ok(inode);
 }
 
@@ -459,7 +460,7 @@ static inline bool sus_path_entry_gate_inode(const struct sus_path_entry *e,
 static inline bool sus_path_entry_gate_any(const struct sus_path_entry *e)
 {
     if (e->self_protect)
-        return current_uid().val != 0;
+        return !susfs_control_visible();
     if (!e->inode)
         return sus_path_gate_uid_ok();
     return sus_path_gate_ok(e->inode);
@@ -2103,7 +2104,7 @@ static int sus_path_proc_open(struct inode *inode, struct file *file)
 {
     /* 0777 node + this check: a restrictive mode would answer EACCES (advertising that the
      * node exists) before sus_path could answer ENOENT. */
-    if (current_uid().val != 0)
+    if (!susfs_control_visible())
         return -ENOENT;
     return single_open(file, sus_path_proc_show, NULL);
 }
@@ -2116,7 +2117,7 @@ static ssize_t sus_path_proc_write(struct file *file, const char __user *buf,
 
     /* Same reason as the open check: an fd opened before the process dropped
      * privileges must not become a way in. */
-    if (current_uid().val != 0)
+    if (!susfs_control_visible())
         return -ENOENT;
     if (len == 0)
         return 0;

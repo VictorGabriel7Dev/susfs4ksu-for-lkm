@@ -50,6 +50,18 @@ static inline bool susfs_ksu_allow_current(void)
 	return susfs_ksu_allow_uid(current_uid().val);
 }
 
+/* "May this process use the module's control surface?"  The SAME gate KernelSU applies before it
+ * would give this uid su: sucompat calls ksu_is_allow_uid_for_current(), which allowlist.h defines
+ * as exactly this predicate - so it carries forbid_system_uid, "manager is always allowed", the
+ * allowed-shell rule and the allowlist profile's allow_su, and __ksu_is_allow_uid_for_current()
+ * adds the shell-only check before asking.  Every control node's open/write handler and sus_path's
+ * self-protect rules ask this one question, which is what keeps "the nodes are visible" and "su is
+ * available" the same set of processes instead of two policies that can drift apart. */
+static inline bool susfs_control_visible(void)
+{
+	return susfs_ksu_allow_current();
+}
+
 int susfs_ksu_allow_gate_init(void);
 
 #endif /* __SUSFS_KSU_ALLOW_GATE_H */
