@@ -103,42 +103,42 @@ static void susfs_self_hide_nodes(void)
  * This runs once at load, on inodes nobody has opened yet; a plain 32-bit store needs no lock. */
 #if LINUX_VERSION_CODE < KERNEL_VERSION(6, 4, 0)
 static const char susfs_control_selinux_ctx[] = "u:object_r:ksu_file:s0";
+static const char susfs_proc_selinux_ctx[] = "u:object_r:proc:s0";
 static size_t susfs_isec_sid_offset;
 static u32 susfs_control_sid;
+static u32 susfs_proc_sid;
 
 static bool susfs_prepare_control_sid(void)
 {
-    size_t inode_off;
-
     if (security_secctx_to_secid(susfs_control_selinux_ctx,
                                  strlen(susfs_control_selinux_ctx),
                                  &susfs_control_sid) ||
         !susfs_control_sid)
         return false;
+    if (security_secctx_to_secid(susfs_proc_selinux_ctx,
+                                 strlen(susfs_proc_selinux_ctx),
+                                 &susfs_proc_sid) ||
+        !susfs_proc_sid)
+        return false;
     /* Idempotent: the fsnotify layer has usually called this already. */
     if (susfs_btf_layout_init())
-        return false;
-    /* The struct has to start with its back pointer (that is what susfs_set_inode_sid() checks
-     * before writing); a layout without it gets no label rather than a write at a guess. */
-    if (susfs_btf_field_offset("inode_security_struct", "inode", "inode*", &inode_off) ||
-        inode_off != 0)
         return false;
     return !susfs_btf_member_offset("inode_security_struct", "sid", "uint",
                                     &susfs_isec_sid_offset);
 }
 
+/* The write is only made where the field already holds the proc label: that proves both that
+ * inode->i_security is SELinux's own blob (not a per-LSM one) and that the BTF offset is right for
+ * this kernel.  Anything else is left alone - a wrong guess here would corrupt a live struct. */
 static void susfs_set_inode_sid(struct inode *inode, u32 sid)
 {
     u32 *field;
 
     if (!inode->i_security)
         return;
-    /* struct inode_security_struct starts with a back pointer to its inode.  If that is not this
-     * inode, the blob is not SELinux's struct (a 6.4+ per-LSM layout, or another owner) and the
-     * offset means nothing here - skip instead of corrupting it. */
-    if (READ_ONCE(*(struct inode **)inode->i_security) != inode)
-        return;
     field = (u32 *)((char *)inode->i_security + susfs_isec_sid_offset);
+    if (READ_ONCE(*field) != susfs_proc_sid)
+        return;
     WRITE_ONCE(*field, sid);
 }
 #endif
@@ -151,7 +151,7 @@ static void susfs_relabel_control_nodes(void)
      * module's own visibility gate is unaffected. */
     return;
 #else
-    int i;
+    int i, changed = 0;
 
     if (!susfs_expose_proc)
         return;
@@ -161,12 +161,24 @@ static void susfs_relabel_control_nodes(void)
     }
     for (i = 0; i < ARRAY_SIZE(susfs_self_hide_paths); i++) {
         struct path p;
+        struct inode *inode;
 
         if (kern_path(susfs_self_hide_paths[i], 0, &p))
             continue;
-        susfs_set_inode_sid(d_inode(p.dentry), susfs_control_sid);
+        inode = d_inode(p.dentry);
+        if (inode && inode->i_security) {
+            u32 *field = (u32 *)((char *)inode->i_security +
+                                 susfs_isec_sid_offset);
+
+            if (READ_ONCE(*field) == susfs_proc_sid) {
+                susfs_set_inode_sid(inode, susfs_control_sid);
+                changed++;
+            }
+        }
         path_put(&p);
     }
+    SUSFS_LOGI("susfs: %d control node(s) relabelled to %s\n",
+               changed, susfs_control_selinux_ctx);
 #endif
 }
 
