@@ -52,6 +52,11 @@ static struct sufs_route sufs_routes[SUFS_ROUTE_MAX];
 static int sufs_nroutes;	/* highest slot ever used, plus one: the scan bound */
 static DEFINE_MUTEX(sufs_router_lock);
 static atomic_t sufs_router_hits = ATOMIC_INIT(0);
+/* Diagnostics: the last key a lookup missed with.  When a route exists but the entry cannot find
+ * it, this is what says whether the key is wrong (parent inode) or the name is. */
+static unsigned long sufs_router_last_pino;
+static char sufs_router_last_name[SUFS_ROUTE_NAME_MAX];
+static atomic_t sufs_router_misses = ATOMIC_INIT(0);
 
 /* Caller holds sufs_router_lock. */
 static int sufs_router_find_locked(unsigned long pino, const char *name, size_t len)
@@ -87,6 +92,11 @@ bool sufs_router_match_path(const struct path *path, char *buf, size_t buflen)
 	pino_inode = d_inode(d->d_parent);
 	if (!pino_inode)
 		return false;
+
+	/* Recorded before the scan: on a miss this is exactly what was looked for. */
+	sufs_router_last_pino = pino_inode->i_ino;
+	strscpy(sufs_router_last_name, d->d_name.name, sizeof(sufs_router_last_name));
+	atomic_inc(&sufs_router_misses);
 
 	rcu_read_lock();
 	for (i = 0; i < READ_ONCE(sufs_nroutes); i++) {
