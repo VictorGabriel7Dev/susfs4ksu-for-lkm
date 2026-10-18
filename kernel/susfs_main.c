@@ -104,12 +104,18 @@ static void susfs_self_hide_nodes(void)
 #if LINUX_VERSION_CODE < KERNEL_VERSION(6, 4, 0)
 static const char susfs_control_selinux_ctx[] = "u:object_r:ksu_file:s0";
 static const char susfs_proc_selinux_ctx[] = "u:object_r:proc:s0";
+static size_t susfs_isec_base_offset;	/* SELinux's slot inside inode->i_security */
 static size_t susfs_isec_sid_offset;
 static u32 susfs_control_sid;
 static u32 susfs_proc_sid;
 
 static bool susfs_prepare_control_sid(void)
 {
+    unsigned long blob_sizes;
+    size_t lbs_inode_off;
+    int sel_off;
+    int rc;
+
     if (security_secctx_to_secid(susfs_control_selinux_ctx,
                                  strlen(susfs_control_selinux_ctx),
                                  &susfs_control_sid) ||
@@ -123,20 +129,36 @@ static bool susfs_prepare_control_sid(void)
     /* Idempotent: the fsnotify layer has usually called this already. */
     if (susfs_btf_layout_init())
         return false;
-    return !susfs_btf_member_offset("inode_security_struct", "sid", "uint",
-                                    &susfs_isec_sid_offset);
+    /* Every Android 5.15 here carries the per-LSM blob allocation even though the split landed
+     * upstream later: inode->i_security is then a blob whose SELinux slot starts at
+     * selinux_blob_sizes.lbs_inode.  A kernel without that symbol is the older shape, where
+     * inode->i_security IS the struct and the base stays 0. */
+    blob_sizes = find_kernel_symbol_exact("selinux_blob_sizes");
+    if (blob_sizes) {
+        if (susfs_btf_member_offset("lsm_blob_sizes", "lbs_inode", "int",
+                                    &lbs_inode_off))
+            return false;
+        sel_off = READ_ONCE(*(int *)((char *)blob_sizes + lbs_inode_off));
+        if (sel_off < 0 || sel_off > 4096)
+            return false;
+        susfs_isec_base_offset = (size_t)sel_off;
+    }
+    rc = susfs_btf_member_offset("inode_security_struct", "sid", "uint",
+                                 &susfs_isec_sid_offset);
+    return !rc;
 }
 
-/* The write is only made where the field already holds the proc label: that proves both that
- * inode->i_security is SELinux's own blob (not a per-LSM one) and that the BTF offset is right for
- * this kernel.  Anything else is left alone - a wrong guess here would corrupt a live struct. */
+/* The write is only made where the field already holds the proc label: that is what proves the
+ * base, the offset and the blob ownership are all right on the kernel actually running.  Anything
+ * else is left alone - a wrong guess here would corrupt a live struct. */
 static void susfs_set_inode_sid(struct inode *inode, u32 sid)
 {
     u32 *field;
 
     if (!inode->i_security)
         return;
-    field = (u32 *)((char *)inode->i_security + susfs_isec_sid_offset);
+    field = (u32 *)((char *)inode->i_security + susfs_isec_base_offset +
+                    susfs_isec_sid_offset);
     if (READ_ONCE(*field) != susfs_proc_sid)
         return;
     WRITE_ONCE(*field, sid);
@@ -146,9 +168,8 @@ static void susfs_set_inode_sid(struct inode *inode, u32 sid)
 static void susfs_relabel_control_nodes(void)
 {
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
-    /* 6.4 split inode security into per-LSM blobs: inode->i_security is no longer SELinux's
-     * struct, so the write below is not valid there.  The nodes keep the default label; the
-     * module's own visibility gate is unaffected. */
+    /* The split is upstream here and the blob walk above is untested there; the nodes keep the
+     * default label, and the module's own visibility gate is unaffected. */
     return;
 #else
     int i, changed = 0;
@@ -168,6 +189,7 @@ static void susfs_relabel_control_nodes(void)
         inode = d_inode(p.dentry);
         if (inode && inode->i_security) {
             u32 *field = (u32 *)((char *)inode->i_security +
+                                 susfs_isec_base_offset +
                                  susfs_isec_sid_offset);
 
             if (READ_ONCE(*field) == susfs_proc_sid) {
