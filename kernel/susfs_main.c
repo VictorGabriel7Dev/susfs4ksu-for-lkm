@@ -23,6 +23,7 @@
 #include "susfs.h"
 #include "susfs_opath.h"	/* SUSFS_OPATH_NODE + the layer's init/exit */
 #include "sufs_fs.h"		/* the privileged view's own filesystem (privfs) */
+#include "btf_layout.h"		/* the SELinux inode_security_struct.sid offset, by BTF */
 
 /* The module's own name lives in susfs.h (SUSFS_LKM_MODULE_NAME / SUSFS_LKM_SYSFS_DIR):
  * /sys/module's directory and the rules that hide it (susfs_hide_syms.c) must agree, and the
@@ -85,55 +86,88 @@ static void susfs_self_hide_nodes(void)
     }
 }
 
-/* The control nodes inherit procfs's default label, u:object_r:proc:s0, whose policy refuses an adb
- * shell even when this module's own gate allowed it (measured: `cat /proc/susfs_open_redirect` from
- * u:r:shell:s0 is EACCES, while the same read from u:r:ksu:s0 works).  ksu_file is the type the
- * KernelSU policy already grants to the processes that may use su - exactly the set these nodes
- * exist for - so the nodes are moved under it once they exist.
+/* The control nodes are born with procfs's default label, u:object_r:proc:s0, whose policy refuses
+ * even an adb shell that this module's gate accepted (measured: `cat /proc/susfs_open_redirect`
+ * from u:r:shell:s0 is EACCES, while the same read from u:r:ksu:s0 works).  ksu_file is the type
+ * the KernelSU policy already grants to the processes that may use su - exactly the set these
+ * nodes exist for - so they are moved under it.
  *
- * Not fatal, and not even noisy: a kernel without SELinux, or a policy without a ksu_file type,
- * answers the setsecurity with an error and the nodes simply keep the default label.  The call is
- * made through a resolved pointer for the same reason every other kernel call here is: the symbol
- * is checked at load (imports_guard.c), never linked against. */
+ * There is no LSM interface for this: security_inode_setsecurity() has no inode_setsecurity hook
+ * registered on this kernel (it answers the framework default, -EOPNOTSUPP, for either spelling of
+ * the attribute name), and procfs has no xattr handler to go through the VFS.  What is left is the
+ * field SELinux itself reads: inode->i_security points at its private inode_security_struct (until
+ * the per-LSM blob split in 6.4), and the `sid` member is what every check uses.  The offset comes
+ * from BTF and the member's type is verified, so a kernel whose layout moved it is refused instead
+ * of being written at a guess.
+ *
+ * This runs once at load, on inodes nobody has opened yet; a plain 32-bit store needs no lock. */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 4, 0)
 static const char susfs_control_selinux_ctx[] = "u:object_r:ksu_file:s0";
-static int (*susfs_security_inode_setsecurity_fn)(struct inode *inode, const char *name,
-						  const void *value, size_t size, int flags);
+static size_t susfs_isec_sid_offset;
+static u32 susfs_control_sid;
 
-/* __nocfi noinline: an indirect call into the kernel, like every other resolved pointer here. */
-static __nocfi noinline int susfs_set_inode_security(struct inode *inode, const char *name,
-						     const void *value, size_t size)
+static bool susfs_prepare_control_sid(void)
 {
-	return susfs_security_inode_setsecurity_fn(inode, name, value, size, 0);
+    size_t inode_off;
+
+    if (security_secctx_to_secid(susfs_control_selinux_ctx,
+                                 strlen(susfs_control_selinux_ctx),
+                                 &susfs_control_sid) ||
+        !susfs_control_sid)
+        return false;
+    /* Idempotent: the fsnotify layer has usually called this already. */
+    if (susfs_btf_layout_init())
+        return false;
+    /* The struct has to start with its back pointer (that is what susfs_set_inode_sid() checks
+     * before writing); a layout without it gets no label rather than a write at a guess. */
+    if (susfs_btf_field_offset("inode_security_struct", "inode", "inode*", &inode_off) ||
+        inode_off != 0)
+        return false;
+    return !susfs_btf_member_offset("inode_security_struct", "sid", "uint",
+                                    &susfs_isec_sid_offset);
 }
+
+static void susfs_set_inode_sid(struct inode *inode, u32 sid)
+{
+    u32 *field;
+
+    if (!inode->i_security)
+        return;
+    /* struct inode_security_struct starts with a back pointer to its inode.  If that is not this
+     * inode, the blob is not SELinux's struct (a 6.4+ per-LSM layout, or another owner) and the
+     * offset means nothing here - skip instead of corrupting it. */
+    if (READ_ONCE(*(struct inode **)inode->i_security) != inode)
+        return;
+    field = (u32 *)((char *)inode->i_security + susfs_isec_sid_offset);
+    WRITE_ONCE(*field, sid);
+}
+#endif
 
 static void susfs_relabel_control_nodes(void)
 {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
+    /* 6.4 split inode security into per-LSM blobs: inode->i_security is no longer SELinux's
+     * struct, so the write below is not valid there.  The nodes keep the default label; the
+     * module's own visibility gate is unaffected. */
+    return;
+#else
     int i;
 
-    if (!susfs_security_inode_setsecurity_fn || !susfs_expose_proc)
+    if (!susfs_expose_proc)
         return;
-
+    if (!susfs_prepare_control_sid()) {
+        SUSFS_LOGI("susfs: no ksu_file label applied (context or BTF layout unavailable)\n");
+        return;
+    }
     for (i = 0; i < ARRAY_SIZE(susfs_self_hide_paths); i++) {
         struct path p;
-        int rc;
 
         if (kern_path(susfs_self_hide_paths[i], 0, &p))
             continue;
-        /* The LSM hook's naming is not worth guessing: the VFS path passes the fully qualified
-         * "security.selinux", while SELinux's own implementation compares against the bare
-         * suffix.  Try both, so a kernel whose hook accepts either spelling works. */
-        rc = susfs_set_inode_security(d_inode(p.dentry), "security.selinux",
-                                      susfs_control_selinux_ctx,
-                                      sizeof(susfs_control_selinux_ctx) - 1);
-        if (rc)
-            rc = susfs_set_inode_security(d_inode(p.dentry), "selinux",
-                                          susfs_control_selinux_ctx,
-                                          sizeof(susfs_control_selinux_ctx) - 1);
+        susfs_set_inode_sid(d_inode(p.dentry), susfs_control_sid);
         path_put(&p);
-        if (rc)
-            SUSFS_LOGI("susfs: label %s as %s refused %d (kept the default label)\n",
-                       susfs_self_hide_paths[i], susfs_control_selinux_ctx, rc);
     }
+#endif
 }
 
 /* ---- layer table: arming order IS the teardown order, reversed --------------
@@ -258,10 +292,6 @@ static int __init susfs_init(void)
      * goes through static calls and this only costs the layers that do patch. */
     if (ksu_patch_memory_init())
         pr_warn("susfs_guard_lkm: patching unavailable on this kernel (see patch_memory.c)\n");
-
-    /* Optional, for the control nodes' SELinux label: without it they keep procfs's default. */
-    susfs_security_inode_setsecurity_fn =
-        (void *)find_kernel_symbol_exact("security_inode_setsecurity");
 
     for (i = 0; i < (int)ARRAY_SIZE(susfs_layers); i++) {
         int ret;
