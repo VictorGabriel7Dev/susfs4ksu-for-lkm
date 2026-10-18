@@ -252,11 +252,10 @@ int susfs_router_format(char *buf, size_t size)
 	int i, n = 0;
 
 	n += scnprintf(buf + n, size - n,
-		       n += scnprintf(buf + n, size - n,
-		       	       "sufs_router: %d route(s), hits=%d, misses=%d, last miss %lu/%s\n",
-		       	       sufs_nroutes, atomic_read(&sufs_router_hits),
-		       	       atomic_read(&sufs_router_misses),
-		       	       sufs_router_last_pino, sufs_router_last_name);
+		       "sufs_router: %d route(s), hits=%d, misses=%d, last miss %lu/%s\n",
+		       sufs_nroutes, atomic_read(&sufs_router_hits),
+		       atomic_read(&sufs_router_misses),
+		       sufs_router_last_pino, sufs_router_last_name);
 	for (i = 0; i < sufs_nroutes && (size_t)n < size; i++) {
 		if (!READ_ONCE(sufs_routes[i].live))
 			continue;
