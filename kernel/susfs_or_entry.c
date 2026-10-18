@@ -261,6 +261,7 @@ static __nocfi noinline long or_entry_redirect(const struct pt_regs *regs, int k
 	int dfd = AT_FDCWD;
 	long res;
 	int fd;
+	int m;
 
 	if (!or_entry_ready)
 		return SUSFS_OR_ENTRY_PASS;
@@ -453,7 +454,16 @@ static __nocfi noinline long or_entry_redirect(const struct pt_regs *regs, int k
 	 * recycled after a grace period, so nothing inside an entry may be used after this call). */
 	/* The view's jump table first, then the open_redirect rules: the table is the
 	 * view, the rules are the older per-inode mechanism, and both can name a target. */
-	if (!sufs_router_match_path(&path, target, sizeof(target)) &&
+	m = sufs_router_match_path(&path, target, sizeof(target));
+	if (m == SUFS_ROUTE_DENIED) {
+		/* The name is routed and this caller is not accepted.  It is a name that exists on
+		 * disk (the absent ones never resolve), so the kernel would open the real file -
+		 * answer the ENOENT the view means instead. */
+		path_put(&path);
+		or_putname_fn(name);
+		return -ENOENT;
+	}
+	if (m == SUFS_ROUTE_MISS &&
 	    !susfs_open_redirect_match_path(&path, target, sizeof(target))) {
 		path_put(&path);
 		or_putname_fn(name);

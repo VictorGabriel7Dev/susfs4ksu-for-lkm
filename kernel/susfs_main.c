@@ -19,6 +19,7 @@
 #include "susfs.h"
 #include "susfs_opath.h"	/* SUSFS_OPATH_NODE + the layer's init/exit */
 #include "sufs_fs.h"		/* the privileged view's own filesystem (privfs) */
+#include "sufs_stat_entry.h"	/* stat/statx follow the view at the syscall entry */
 
 /* The module's own name lives in susfs.h (SUSFS_LKM_MODULE_NAME / SUSFS_LKM_SYSFS_DIR):
  * /sys/module's directory and the rules that hide it (susfs_hide_syms.c) must agree, and the
@@ -127,6 +128,9 @@ static struct {
      * post-hoc filter still hides, it is only detectable while doing so. */
     { "dirent",		susfs_sus_dirent_init,		susfs_sus_dirent_exit,	false, false },
     { "uname",		susfs_uname_init,		susfs_uname_exit,	false, false },
+    /* Before kstat: the kstat wrappers call into this layer before running the original, so the
+     * symbols have to be resolved by the time they can be reached. */
+    { "stat_entry",	susfs_stat_entry_init,		susfs_stat_entry_exit,	false, false },
     { "kstat",		susfs_kstat_init,		susfs_kstat_exit,	false, false },
     { "sus_map",	susfs_sus_map_init,		susfs_sus_map_exit,	false, false },
     { "sus_mount",	susfs_sus_mount_init,		susfs_sus_mount_exit,	false, false },

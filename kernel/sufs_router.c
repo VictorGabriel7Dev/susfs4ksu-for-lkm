@@ -59,6 +59,7 @@ static struct sufs_route sufs_routes[SUFS_ROUTE_MAX];
 static int sufs_nroutes;	/* highest slot ever used, plus one: the scan bound */
 static DEFINE_MUTEX(sufs_router_lock);
 static atomic_t sufs_router_hits = ATOMIC_INIT(0);
+static atomic_t sufs_router_denied = ATOMIC_INIT(0);
 /* Diagnostics: the last key a lookup missed with.  When a route exists but the entry cannot find
  * it, this is what says whether the key is wrong (parent inode) or the name is. */
 static unsigned long sufs_router_last_pino;
@@ -136,32 +137,24 @@ static unsigned int sufs_dtype(umode_t mode)
 }
 
 /* The name part of a resolved path, without copying: dentry names are stable while the caller
- * holds a reference, which or_entry does for the duration of its call. */
-bool sufs_router_match_path(const struct path *path, char *buf, size_t buflen)
+ * holds a reference, which or_entry does for the duration of its call.  Three answers - see
+ * SUFS_ROUTE_*: the caller has to know whether the name is merely not routed (the kernel answers)
+ * or routed but not for it (the entry answers -ENOENT itself, which is what hides a name that is
+ * really on disk). */
+int sufs_router_match_path(const struct path *path, char *buf, size_t buflen)
 {
 	struct dentry *d;
 	struct inode *pino_inode;
-	int i;
-	bool hit = false;
+	int i, found = -1;
 
-	/* The predicate first: for a caller KernelSU does not accept, the route does not exist at
-	 * all, and there is nothing to look up.  This is the whole difference between the two views -
-	 * one question, one answer, and the table above is the only state either side reads. */
-	if (!susfs_ksu_allow_current())
-		return false;
 	if (!path || !path->dentry)
-		return false;
+		return SUFS_ROUTE_MISS;
 	d = path->dentry;
 	if (d->d_parent == d)		/* the root of a mount is not a routed name */
-		return false;
+		return SUFS_ROUTE_MISS;
 	pino_inode = d_inode(d->d_parent);
 	if (!pino_inode)
-		return false;
-
-	/* Recorded before the scan: on a miss this is exactly what was looked for. */
-	sufs_router_last_pino = pino_inode->i_ino;
-	strscpy(sufs_router_last_name, d->d_name.name, sizeof(sufs_router_last_name));
-	atomic_inc(&sufs_router_misses);
+		return SUFS_ROUTE_MISS;
 
 	rcu_read_lock();
 	for (i = 0; i < READ_ONCE(sufs_nroutes); i++) {
@@ -178,16 +171,31 @@ bool sufs_router_match_path(const struct path *path, char *buf, size_t buflen)
 		if (strlen(r->name) != d->d_name.len ||
 		    memcmp(r->name, d->d_name.name, d->d_name.len))
 			continue;
-		if (strscpy(buf, r->target, buflen) < 0)
-			continue;
-		hit = true;
+		found = i;
 		break;
 	}
 	rcu_read_unlock();
 
-	if (hit)
-		atomic_inc(&sufs_router_hits);
-	return hit;
+	if (found < 0) {
+		/* Recorded on a miss: this is exactly what was looked for. */
+		sufs_router_last_pino = pino_inode->i_ino;
+		strscpy(sufs_router_last_name, d->d_name.name, sizeof(sufs_router_last_name));
+		atomic_inc(&sufs_router_misses);
+		return SUFS_ROUTE_MISS;
+	}
+
+	/* The predicate is asked only once the key has matched: for a name the table does not
+	 * carry, its answer changes nothing. */
+	if (!susfs_ksu_allow_current()) {
+		atomic_inc(&sufs_router_denied);
+		return SUFS_ROUTE_DENIED;
+	}
+	atomic_inc(&sufs_router_hits);
+	/* A live slot is never rewritten (removal only clears ->live and slots are not reused),
+	 * so reading the target after the rcu section is safe. */
+	if (strscpy(buf, sufs_routes[found].target, buflen) < 0)
+		return SUFS_ROUTE_MISS;
+	return SUFS_ROUTE_HIT;
 }
 
 /* The entry layer's fast path: one load when the table is empty, which is the common case. */
@@ -423,8 +431,9 @@ int susfs_router_format(char *buf, size_t size)
 			nroutes++;
 	}
 	n += scnprintf(buf + n, size - n,
-		       "sufs_router: %d route(s), hits=%d, misses=%d, last miss %lu/%s\n",
+		       "sufs_router: %d route(s), hits=%d, denied=%d, misses=%d, last miss %lu/%s\n",
 		       nroutes, atomic_read(&sufs_router_hits),
+		       atomic_read(&sufs_router_denied),
 		       atomic_read(&sufs_router_misses),
 		       sufs_router_last_pino, sufs_router_last_name);
 	for (i = 0; i < sufs_nroutes && (size_t)n < size; i++) {

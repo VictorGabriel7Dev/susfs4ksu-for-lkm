@@ -17,10 +17,20 @@ struct sufs_route_desc {
 	unsigned int d_type;
 };
 
+/* What a resolved path means to an entry layer.  There are three answers, not two: "not routed"
+ * hands the call back to the kernel, "routed but this caller is not accepted" must be answered
+ * -ENOENT by the entry itself (for a name that really exists on disk that is the hiding), and
+ * "routed and accepted" carries the target. */
+enum {
+	SUFS_ROUTE_MISS = 0,
+	SUFS_ROUTE_HIT = 1,
+	SUFS_ROUTE_DENIED = 2,
+};
+
 int sufs_router_add(const char *view_path, const char *target_path);
 void sufs_router_del(const char *view_path);
 bool sufs_router_active(void);
-bool sufs_router_match_path(const struct path *path, char *buf, size_t buflen);
+int sufs_router_match_path(const struct path *path, char *buf, size_t buflen);
 bool sufs_router_match_parent(const struct inode *dir, const char *name, size_t len,
 			      char *buf, size_t buflen);
 bool sufs_router_has_name(const struct inode *dir, const char *name, size_t len);
