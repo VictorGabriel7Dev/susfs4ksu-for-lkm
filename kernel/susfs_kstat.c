@@ -56,7 +56,6 @@
 #include "susfs_fp_hook.h"	/* struct susfs_fp_hook + install/remove/drain: the table entries */
 #include "ksu_umount_gate.h"	/* susfs_is_current_proc_umounted_app (issue #34) */
 #include "susfs_kprobe.h"
-#include "sufs_stat_entry.h"	/* the view's stat entry: runs before the original below */
 
 /* KSTAT_SPOOF_* bits live in susfs_abi.h (upstream declares them in susfs.h next to struct
  * st_susfs_sus_kstat).  KSTAT_AUTO_SPOOF* below are /proc-interface masks, not supercall ABI. */
@@ -1647,8 +1646,6 @@ static susfs_syscall_fn_t kstat_orig_compat_getdents;
 		 * syscall_get_arguments() asks for a non-const one it only reads - the	\
 		 * cast is what that difference costs, and nothing here writes regs. */	\
 		syscall_get_arguments(current, (struct pt_regs *)regs, a);	\
-		if (susfs_stat_pre(nrval, combat, regs, &out))		\
-			return out;					\
 		ret = orig(regs);					\
 		out = ret;						\
 		susfs_kstat_post(nrval, combat, a, ret, &out);		\
