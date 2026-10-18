@@ -119,11 +119,16 @@ static void susfs_relabel_control_nodes(void)
 
         if (kern_path(susfs_self_hide_paths[i], 0, &p))
             continue;
-        /* SELinux's inode_setsecurity expects the attribute's suffix, not the
-         * "security.selinux" name the VFS uses at its own layer. */
-        rc = susfs_set_inode_security(d_inode(p.dentry), "selinux",
+        /* The LSM hook's naming is not worth guessing: the VFS path passes the fully qualified
+         * "security.selinux", while SELinux's own implementation compares against the bare
+         * suffix.  Try both, so a kernel whose hook accepts either spelling works. */
+        rc = susfs_set_inode_security(d_inode(p.dentry), "security.selinux",
                                       susfs_control_selinux_ctx,
                                       sizeof(susfs_control_selinux_ctx) - 1);
+        if (rc)
+            rc = susfs_set_inode_security(d_inode(p.dentry), "selinux",
+                                          susfs_control_selinux_ctx,
+                                          sizeof(susfs_control_selinux_ctx) - 1);
         path_put(&p);
         if (rc)
             SUSFS_LOGI("susfs: label %s as %s refused %d (kept the default label)\n",
