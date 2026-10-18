@@ -35,6 +35,7 @@
 #include <linux/fs.h>
 
 #include "sufs_router.h"
+#include "ksu_allow_gate.h"	/* who is allowed to see the view */
 #include "susfs.h"	/* SUSFS_OR_PATH_MAX */
 #include "susfs_log.h"
 
@@ -84,6 +85,11 @@ bool sufs_router_match_path(const struct path *path, char *buf, size_t buflen)
 	int i;
 	bool hit = false;
 
+	/* The predicate first: for a caller KernelSU does not accept, the route does not exist at
+	 * all, and there is nothing to look up.  This is the whole difference between the two views -
+	 * one question, one answer, and the table above is the only state either side reads. */
+	if (!susfs_ksu_allow_current())
+		return false;
 	if (!path || !path->dentry)
 		return false;
 	d = path->dentry;
