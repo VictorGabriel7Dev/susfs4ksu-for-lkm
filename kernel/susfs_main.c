@@ -9,6 +9,10 @@
 #include <linux/kernel.h>
 #include <linux/init.h>
 #include <linux/version.h>	/* LINUX_VERSION_CODE: the MODULE_IMPORT_NS spelling below */
+#include <linux/fs.h>		/* d_inode() for the control-node labels */
+#include <linux/namei.h>	/* kern_path() */
+#include <linux/path.h>		/* path_put() */
+#include <linux/security.h>	/* security_inode_setsecurity(): the nodes' SELinux label */
 
 #include "symbol_resolver.h"
 #include "patch_memory.h"	/* ksu_patch_memory_init(): the flush helper's name differs per kernel */
@@ -78,6 +82,52 @@ static void susfs_self_hide_nodes(void)
         if (rc)
             pr_warn("susfs_guard_lkm: self-hide %s failed %d\n",
                     susfs_self_hide_paths[i], rc);
+    }
+}
+
+/* The control nodes inherit procfs's default label, u:object_r:proc:s0, whose policy refuses an adb
+ * shell even when this module's own gate allowed it (measured: `cat /proc/susfs_open_redirect` from
+ * u:r:shell:s0 is EACCES, while the same read from u:r:ksu:s0 works).  ksu_file is the type the
+ * KernelSU policy already grants to the processes that may use su - exactly the set these nodes
+ * exist for - so the nodes are moved under it once they exist.
+ *
+ * Not fatal, and not even noisy: a kernel without SELinux, or a policy without a ksu_file type,
+ * answers the setsecurity with an error and the nodes simply keep the default label.  The call is
+ * made through a resolved pointer for the same reason every other kernel call here is: the symbol
+ * is checked at load (imports_guard.c), never linked against. */
+static const char susfs_control_selinux_ctx[] = "u:object_r:ksu_file:s0";
+static int (*susfs_security_inode_setsecurity_fn)(struct inode *inode, const char *name,
+						  const void *value, size_t size, int flags);
+
+/* __nocfi noinline: an indirect call into the kernel, like every other resolved pointer here. */
+static __nocfi noinline int susfs_set_inode_security(struct inode *inode, const char *name,
+						     const void *value, size_t size)
+{
+	return susfs_security_inode_setsecurity_fn(inode, name, value, size, 0);
+}
+
+static void susfs_relabel_control_nodes(void)
+{
+    int i;
+
+    if (!susfs_security_inode_setsecurity_fn || !susfs_expose_proc)
+        return;
+
+    for (i = 0; i < ARRAY_SIZE(susfs_self_hide_paths); i++) {
+        struct path p;
+        int rc;
+
+        if (kern_path(susfs_self_hide_paths[i], 0, &p))
+            continue;
+        /* SELinux's inode_setsecurity expects the attribute's suffix, not the
+         * "security.selinux" name the VFS uses at its own layer. */
+        rc = susfs_set_inode_security(d_inode(p.dentry), "selinux",
+                                      susfs_control_selinux_ctx,
+                                      sizeof(susfs_control_selinux_ctx) - 1);
+        path_put(&p);
+        if (rc)
+            SUSFS_LOGI("susfs: label %s as %s refused %d (kept the default label)\n",
+                       susfs_self_hide_paths[i], susfs_control_selinux_ctx, rc);
     }
 }
 
@@ -204,6 +254,10 @@ static int __init susfs_init(void)
     if (ksu_patch_memory_init())
         pr_warn("susfs_guard_lkm: patching unavailable on this kernel (see patch_memory.c)\n");
 
+    /* Optional, for the control nodes' SELinux label: without it they keep procfs's default. */
+    susfs_security_inode_setsecurity_fn =
+        (void *)find_kernel_symbol_exact("security_inode_setsecurity");
+
     for (i = 0; i < (int)ARRAY_SIZE(susfs_layers); i++) {
         int ret;
 
@@ -235,6 +289,7 @@ static int __init susfs_init(void)
     /* Registered last and undone implicitly: these are entries in sus_path's table, which
      * sus_path_exit() empties while its LSM layer still answers ENOENT for the nodes. */
     susfs_self_hide_nodes();
+    susfs_relabel_control_nodes();
 
     /* Operator note.  The module hides its own traces from EVERY caller, root included (a
      * built-in SUSFS has no module entry, so hiding it only from non-root would leave a
