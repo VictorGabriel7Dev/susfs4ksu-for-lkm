@@ -201,6 +201,42 @@ static __nocfi noinline void or_put_unused_fd(unsigned int fd)
  * function this ends up in - the opath wrapper - and a checked indirect call into the kernel is a
  * panic rather than an error return.  This is also why every kernel function above is held in a
  * plain pointer and called from here, never from the wrapper itself. */
+/* Resolve the parent of an absolute path without ever touching the last component.
+ *
+ * filename_parentat() would be the obvious primitive, but it is inlined on this kernel and not
+ * in kallsyms - adding it to the required set is what left the whole open bypass unarmed
+ * ("not armed, a symbol is missing").  Splitting the string and resolving the directory has
+ * the same property that matters: the hidden name is never looked up, so the whiteout cannot
+ * answer for it.
+ *
+ * Relative paths are left to the kernel: resolving them would need the caller's cwd, and the
+ * caller's own fallthrough answer is the correct one anyway. */
+static int or_parent_of(const struct filename *name, struct path *parent, struct qstr *last)
+{
+	char buf[PATH_MAX];
+	const char *full = name->name;
+	char *slash;
+	size_t len;
+
+	if (!full || full[0] != '/')
+		return -EINVAL;
+	len = strlen(full);
+	if (len >= sizeof(buf) || len < 2)
+		return -ENAMETOOLONG;
+	memcpy(buf, full, len + 1);
+	slash = strrchr(buf, '/');
+	if (!slash || !slash[1])
+		return -EINVAL;
+	last->name = full + (size_t)(slash - buf) + 1;
+	last->len = (u32)strlen(slash + 1);
+	if (last->len > NAME_MAX)
+		return -ENAMETOOLONG;
+	*slash = '\0';
+	if (!buf[0])
+		strscpy(buf, "/", sizeof(buf));
+	return kern_path(buf, LOOKUP_FOLLOW, parent);
+}
+
 /* ---- sus_path whiteout bypass (try/dcache-whiteout) ----
  *
  * A rule hid its name with a negative dentry, so any lookup of that name answers ENOENT.  That
@@ -224,8 +260,7 @@ static __nocfi noinline long or_sus_path_whiteout(const struct filename *name, i
 	struct file *f;
 	int type, res, fd;
 
-	res = or_filename_parentat_fn(dfd, (struct filename *)name, 0, &parent, &last,
-				      &type, NULL);
+	res = or_parent_of(name, &parent, &last);
 	if (res)
 		return SUSFS_OR_ENTRY_PASS;
 	if (!sus_path_whiteout_lookup(parent.dentry, &last, &target)) {
@@ -281,14 +316,14 @@ static __nocfi noinline long or_newfstatat(const struct pt_regs *regs)
 	struct filename *name;
 	struct qstr last;
 	struct kstat st;
-	int type, res;
+	int res;
 
-	if (!or_cp_new_stat_fn || !or_filename_parentat_fn)
+	if (!or_cp_new_stat_fn)
 		return or_newfstatat_hook.orig(regs);
 	name = or_getname_flags_fn(uname, 0, NULL);
 	if (IS_ERR(name))
 		return or_newfstatat_hook.orig(regs);
-	res = or_filename_parentat_fn(dfd, name, 0, &parent, &last, &type, NULL);
+	res = or_parent_of(name, &parent, &last);
 	or_putname_fn(name);
 	if (res)
 		return or_newfstatat_hook.orig(regs);
@@ -617,7 +652,7 @@ int susfs_or_entry_init(void)
 
 	if (!or_getname_flags_fn || !or_filename_lookup_fn || !or_putname_fn ||
 	    !or_filp_open_fn || !or_get_unused_fd_flags_fn || !or_fd_install_fn ||
-	    !or_put_unused_fd_fn || !or_filename_parentat_fn) {
+	    !or_put_unused_fd_fn) {
 		SUSFS_LOGI("or_entry: not armed, a symbol is missing (getname_flags=%d filename_lookup=%d putname=%d filp_open=%d get_unused_fd_flags=%d fd_install=%d put_unused_fd=%d) - open_redirect will refuse rules\n",
 			   !!or_getname_flags_fn, !!or_filename_lookup_fn, !!or_putname_fn,
 			   !!or_filp_open_fn, !!or_get_unused_fd_flags_fn, !!or_fd_install_fn,
