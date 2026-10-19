@@ -178,7 +178,7 @@ bool sus_path_inode_hidden_public(struct inode *inode);
  * Returns true with a reference taken in *out when a rule hides that name; the caller owns
  * it and must path_put(). */
 bool sus_path_whiteout_lookup(struct dentry *parent, const struct qstr *name,
-                              struct path *out);
+                              const char *full_path, struct path *out);
 
 /* Whether a 0777 /proc/susfs_* control node may be created.  Two independent conditions, neither optional: susfs_expose_proc
  * (the operator opted in) and sus_path_lsm_active() (with 0777 DAC passes every caller, so only the LSM layer can still

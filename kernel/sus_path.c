@@ -208,32 +208,37 @@ static void sus_path_whiteout_remove(struct sus_path_entry *e)
  * visible to get a path back.  The path is reference-counted under the lock, so it stays valid
  * after unlocking. */
 bool sus_path_whiteout_lookup(struct dentry *parent, const struct qstr *name,
-                              struct path *out)
+                              const char *full_path, struct path *out)
 {
     struct sus_path_entry *e;
     bool found = false;
 
-    if (!READ_ONCE(sus_path_count) || !parent || !name) {
-        pr_info("sus_path: whiteout lookup skipped count=%u parent=%d name=%d\n",
-                READ_ONCE(sus_path_count), !!parent, !!name);
+    if (!READ_ONCE(sus_path_count) || !name) {
+        pr_info("sus_path: whiteout lookup skipped count=%u name=%d\n",
+                READ_ONCE(sus_path_count), !!name);
         return false;
     }
     spin_lock(&sus_path_lock);
     list_for_each_entry(e, &sus_path_list, list) {
-        bool name_ok;
+        bool name_ok, path_ok;
 
         if (!e->whiteout || !e->whiteout_src.dentry) {
             pr_info("sus_path: whiteout rule %s has no whiteout installed\n", e->path);
             continue;
         }
+        /* Two ways to the same answer, and the path string is the one that survives
+         * Android's mount namespaces: every process has its own, so /proc is a DIFFERENT
+         * mount with a different dentry in each (measured: parent=DIFF on every call, with a
+         * new pointer each time), and d_parent can never match there.  The (parent, name)
+         * comparison stays as the exact test for callers that do share the dentry.
+         *
+         * A caller that spells the name differently ("//proc/x", "/proc/./x") matches
+         * neither and gets the kernel's answer: ENOENT from the whiteout, the conservative
+         * direction. */
         name_ok = e->whiteout_src.dentry->d_name.len == name->len &&
                   !memcmp(e->whiteout_src.dentry->d_name.name, name->name, name->len);
-        pr_info("sus_path: whiteout cmp %s: parent=%s name=%s (rule_parent=%px got=%px)\n",
-                e->path,
-                e->whiteout_src.dentry->d_parent == parent ? "same" : "DIFF",
-                name_ok ? "same" : "DIFF",
-                e->whiteout_src.dentry->d_parent, parent);
-        if (e->whiteout_src.dentry->d_parent != parent || !name_ok)
+        path_ok = full_path && !strcmp(e->path, full_path);
+        if (!path_ok && !(parent && e->whiteout_src.dentry->d_parent == parent && name_ok))
             continue;
         if (sus_path_entry_gate_inode(e, e->inode)) {	/* hidden from this caller */
             pr_info("sus_path: whiteout gate hides %.*s (self_protect=%d)\n",

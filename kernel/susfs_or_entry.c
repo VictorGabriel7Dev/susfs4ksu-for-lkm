@@ -281,7 +281,7 @@ static __nocfi noinline long or_sus_path_whiteout(const struct filename *name, i
 	}
 	pr_info("or_entry: whiteout parent ok parent=%px last=%.*s\n",
 		parent.dentry, (int)last.len, last.name);
-	if (!sus_path_whiteout_lookup(parent.dentry, &last, &target)) {
+	if (!sus_path_whiteout_lookup(parent.dentry, &last, name->name, &target)) {
 		pr_info("or_entry: whiteout no rule for %.*s\n", (int)last.len, last.name);
 		path_put(&parent);
 		return SUSFS_OR_ENTRY_PASS;
@@ -351,7 +351,7 @@ static __nocfi noinline long or_newfstatat(const struct pt_regs *regs)
 	or_putname_fn(name);
 	if (res)
 		return or_newfstatat_hook.orig(regs);
-	if (!sus_path_whiteout_lookup(parent.dentry, &last, &target)) {
+	if (!sus_path_whiteout_lookup(parent.dentry, &last, name->name, &target)) {
 		path_put(&parent);
 		return or_newfstatat_hook.orig(regs);
 	}
