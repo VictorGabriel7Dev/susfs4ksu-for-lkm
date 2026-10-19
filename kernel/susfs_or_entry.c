@@ -58,7 +58,10 @@
 #include <linux/err.h>
 #include <linux/atomic.h>
 #include <linux/limits.h>
+#include <linux/stat.h>		/* struct kstat, cp_new_stat's argument */
+#include <asm/unistd.h>		/* __NR_newfstatat */
 #include "susfs.h"
+#include "susfs_fp_hook.h"	/* susfs_fp_install: the stat-side table entry */
 #include "susfs_log.h"
 #include "symbol_resolver.h"
 #include "susfs_or_entry.h"
@@ -141,6 +144,11 @@ static int (*or_filename_lookup_fn)(int dfd, struct filename *name, unsigned fla
 static int (*or_filename_parentat_fn)(int dfd, struct filename *name, unsigned int flags,
 				      struct path *parent, struct qstr *last, int *type,
 				      struct filename **res);
+/* Fills struct stat from a kstat.  Resolved by name instead of reimplemented, so the
+ * translation cannot drift from the kernel's own. */
+static void (*or_cp_new_stat_fn)(struct kstat *stat, struct stat __user *statbuf);
+/* The stat-side table entry (try/dcache-whiteout).  Defined next to its wrapper below. */
+static struct susfs_fp_hook or_newfstatat_hook;
 static void (*or_putname_fn)(struct filename *name);
 static struct file *(*or_filp_open_fn)(const char *name, int flags, umode_t mode);
 static int (*or_get_unused_fd_flags_fn)(unsigned flags);
@@ -255,6 +263,49 @@ static __nocfi noinline long or_sus_path_whiteout(const struct filename *name, i
 	}
 	or_fd_install_fn((unsigned)fd, f);
 	return fd;
+}
+
+/* ---- sus_path whiteout: newfstatat ----
+ *
+ * Same shape as the open bypass, and it has to be the OUTER wrapper: susfs_kstat's is a
+ * post-hoc rewrite, and for a hidden name the syscall it would rewrite never produced a
+ * result (the whiteout answers ENOENT).  Installed later, this hook owns the table entry and
+ * forwards every name it does not hide to kstat's wrapper through .orig.
+ */
+static __nocfi noinline long or_newfstatat(const struct pt_regs *regs)
+{
+	int dfd = (int)regs->regs[0];
+	const char __user *uname = (const char __user *)regs->regs[1];
+	void __user *statbuf = (void __user *)regs->regs[2];
+	struct path parent, target;
+	struct filename *name;
+	struct qstr last;
+	struct kstat st;
+	int type, res;
+
+	if (!or_cp_new_stat_fn || !or_filename_parentat_fn)
+		return or_newfstatat_hook.orig(regs);
+	name = or_getname_flags_fn(uname, 0, NULL);
+	if (IS_ERR(name))
+		return or_newfstatat_hook.orig(regs);
+	res = or_filename_parentat_fn(dfd, name, 0, &parent, &last, &type, NULL);
+	or_putname_fn(name);
+	if (res)
+		return or_newfstatat_hook.orig(regs);
+	if (!sus_path_whiteout_lookup(parent.dentry, &last, &target)) {
+		path_put(&parent);
+		return or_newfstatat_hook.orig(regs);
+	}
+	path_put(&parent);
+	/* The saved path was resolved at registration, so the caller's AT_SYMLINK_NOFOLLOW does
+	 * not apply: the rule's object is what the name stands for. */
+	memset(&st, 0, sizeof(st));
+	res = vfs_getattr(&target, &st, STATX_ALL, 0);
+	path_put(&target);
+	if (res)
+		return res;
+	or_cp_new_stat_fn(&st, statbuf);
+	return 0;
 }
 
 static __nocfi noinline long or_entry_redirect(const struct pt_regs *regs, int kind)
@@ -574,6 +625,21 @@ int susfs_or_entry_init(void)
 		return 0;
 	}
 
+	/* try/dcache-whiteout: the stat side.  Installed here, i.e. after susfs_kstat's wrapper,
+	 * so this hook owns the table entry and forwards every name it does not hide to kstat's
+	 * wrapper through .orig.  Native only: a 32-bit caller keeps the old behaviour. */
+	or_cp_new_stat_fn = (void *)find_kernel_symbol_exact("cp_new_stat");
+	if (or_cp_new_stat_fn) {
+		or_newfstatat_hook.nr = __NR_newfstatat;
+		or_newfstatat_hook.name = "newfstatat";
+		or_newfstatat_hook.sym = "ksys_newfstatat";
+		or_newfstatat_hook.wrapper = or_newfstatat;
+		if (susfs_fp_install(&or_newfstatat_hook))
+			SUSFS_LOGI("or_entry: newfstatat bypass not installed - a hidden stat stays ENOENT\n");
+	} else {
+		SUSFS_LOGI("or_entry: cp_new_stat not found - the newfstatat bypass is off\n");
+	}
+
 	or_entry_ready = true;
 	smp_wmb();
 	WRITE_ONCE(susfs_or_entry_hook, or_entry_redirect);
@@ -586,4 +652,6 @@ void susfs_or_entry_exit(void)
 	WRITE_ONCE(susfs_or_entry_hook, NULL);
 	smp_mb();
 	or_entry_ready = false;
+	/* try/dcache-whiteout: put the stat entry back before this module's text goes away. */
+	susfs_fp_remove(&or_newfstatat_hook);
 }
