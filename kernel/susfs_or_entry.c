@@ -204,8 +204,12 @@ static __nocfi noinline void or_put_unused_fd(unsigned int fd)
  * O_CREAT is satisfied by the object existing (nothing is created), O_EXCL must fail as it
  * would for any existing file, and O_TRUNC is applied by hand because dentry_open() stops at
  * vfs_open(). */
-static long or_sus_path_whiteout(const struct filename *name, int dfd, unsigned long flags,
-				 umode_t mode)
+/* __nocfi noinline for the same reason every other kernel-symbol caller in this file has it:
+ * the indirect calls below (filename_parentat through its pointer, and dentry_open /
+ * vfs_truncate / fput through the module's relocations) must not acquire a CFI check, and the
+ * caller must not inherit them.  The CFI call-site gate is what caught the first version. */
+static __nocfi noinline long or_sus_path_whiteout(const struct filename *name, int dfd,
+						  unsigned long flags, umode_t mode)
 {
 	struct path parent, target;
 	struct qstr last;
