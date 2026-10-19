@@ -224,8 +224,11 @@ bool sus_path_whiteout_lookup(struct dentry *parent, const struct qstr *name,
             e->whiteout_src.dentry->d_name.len != name->len ||
             memcmp(e->whiteout_src.dentry->d_name.name, name->name, name->len))
             continue;
-        if (sus_path_entry_gate_inode(e, e->inode))	/* hidden from this caller */
+        if (sus_path_entry_gate_inode(e, e->inode)) {	/* hidden from this caller */
+            pr_info("sus_path: whiteout gate hides %.*s (self_protect=%d)\n",
+                    (int)name->len, name->name, (int)e->self_protect);
             continue;
+        }
         *out = e->whiteout_src;
         path_get(out);
         found = true;
