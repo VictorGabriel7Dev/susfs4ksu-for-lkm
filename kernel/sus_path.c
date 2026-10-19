@@ -130,6 +130,14 @@ struct sus_path_entry {
     bool self_protect;
     /* Pre-relax mode, 0 = this rule did not touch it (sus_path_relax_mode()). */
     umode_t orig_mode;
+    /* dcache whiteout (try/dcache-whiteout).  whiteout_src is the real object: its dentry is
+     * d_drop()ed out of the hash and kept referenced so the privileged bypass can
+     * dentry_open() it without resolving a name.  whiteout is the negative dentry put under
+     * the same (parent, name) and dget()ed, so the LRU cannot reclaim it.  Together they are
+     * the whole hiding decision: the name fails in the dcache for every caller, and no module
+     * code runs on the lookup path. */
+    struct path whiteout_src;
+    struct dentry *whiteout;
 };
 
 /* Defined next to the readlink stub further down, but called from the pending resolver
@@ -140,6 +148,80 @@ static void sus_path_iop_restore(struct sus_path_entry *e);
  * was (a registered plain file answers EINVAL where stat answers ENOENT) instead of
  * failing the registration - the rule still hides everything the other faces cover. */
 static atomic_t n_iop_arm_fail = ATOMIC_INIT(0);
+
+/* Counted when the whiteout could not be installed: the rule still feeds the dirent filter,
+ * but the name stays visible, and nothing else would say so. */
+static atomic_t n_whiteout_fail = ATOMIC_INIT(0);
+
+/* ---- dcache whiteout ----
+ *
+ * Hiding moves out of the LSM chain and into one dcache entry.  The real dentry is dropped
+ * out of the hash (the name then has no positive entry) and a negative dentry is inserted
+ * under the same (parent, name) and held by us.  Every lookup of the name - open, stat,
+ * unlink, rename, chmod, xattr, inotify_add_watch, for every caller - then fails in the
+ * dcache, so those syscalls answer ENOENT without this module running any code on their
+ * path.  The privileged bypass (susfs_or_entry.c) opens whiteout_src directly and never
+ * consults the dcache.
+ *
+ * Deliberately unmaintained: create() instantiates the negative dentry (or drops it),
+ * rename()/umount() drop it, and the kernel has no notification for any of that.  Keeping it
+ * alive would need per-lookup code, which is the cost this design removes; a rule that must
+ * survive that is the SUS_PATH_LOOP shape, re-added by the user. */
+static int sus_path_whiteout_install(struct sus_path_entry *e, struct path *p)
+{
+    struct dentry *neg;
+
+    d_drop(p->dentry);
+    neg = d_alloc(p->dentry->d_parent, &p->dentry->d_name);
+    if (!neg)
+        return -ENOMEM;
+    d_add(neg, NULL);          /* negative: no inode behind it */
+    dget(neg);                 /* hold it, so the LRU cannot reclaim it */
+    e->whiteout = neg;
+    e->whiteout_src = *p;      /* take over the caller's reference */
+    return 0;
+}
+
+static void sus_path_whiteout_remove(struct sus_path_entry *e)
+{
+    if (e->whiteout) {
+        d_drop(e->whiteout);
+        dput(e->whiteout);
+        e->whiteout = NULL;
+    }
+    if (e->whiteout_src.dentry) {
+        path_put(&e->whiteout_src);
+        memset(&e->whiteout_src, 0, sizeof(e->whiteout_src));
+    }
+}
+
+/* The open bypass asks this with the name already resolved to (parent, last).  The path is
+ * reference-counted under the lock, so the caller can use it after unlocking. */
+bool sus_path_whiteout_lookup(struct dentry *parent, const struct qstr *name,
+                              struct path *out)
+{
+    struct sus_path_entry *e;
+    bool found = false;
+
+    if (!READ_ONCE(sus_path_count) || !parent || !name)
+        return false;
+    spin_lock(&sus_path_lock);
+    list_for_each_entry(e, &sus_path_list, list) {
+        if (!e->whiteout || !e->whiteout_src.dentry)
+            continue;
+        if (e->whiteout_src.dentry->d_parent != parent ||
+            e->whiteout_src.dentry->d_name.hash != name->hash ||
+            e->whiteout_src.dentry->d_name.len != name->len ||
+            memcmp(e->whiteout_src.dentry->d_name.name, name->name, name->len))
+            continue;
+        *out = e->whiteout_src;
+        path_get(out);
+        found = true;
+        break;
+    }
+    spin_unlock(&sus_path_lock);
+    return found;
+}
 
 /* Let DAC through, so that the LSM layer is the only thing that can refuse: DAC runs before the
  * LSM chain and answers EACCES for a denying mode before any hook could turn it into ENOENT.
@@ -227,6 +309,9 @@ static bool sus_path_release_one(struct super_block *sb, const char *path,
     mutex_unlock(&sus_path_lifecycle_lock);
     if (!found)
         return false;
+    /* The whiteout goes first: it has to leave the dcache while the rule's object is still
+     * ours to touch. */
+    sus_path_whiteout_remove(found);
     if (found->inode) {
         /* Before the reference is dropped: after iput() the inode may be evicted, and
          * the store would be into freed memory.  See sus_path_iop_restore(). */
@@ -2514,8 +2599,16 @@ static int sus_path_add_hidden_ex(const char *path, bool self_protect)
         sus_path_iop_restore(e);
         iput(e->inode);
         kfree(e);
+        path_put(&p);
+        return rc;
     }
-    path_put(&p);
+    /* Install the whiteout now that the bypass can find the rule.  On failure the rule stays
+     * in place - it still feeds the dirent filter - but the name is not hidden, and the
+     * counter is the only record of that. */
+    if (sus_path_whiteout_install(e, &p)) {
+        atomic_inc(&n_whiteout_fail);
+        path_put(&p);
+    }
     if (rc < 0)
         return rc;
     sus_path_hooks_arm();
@@ -2536,9 +2629,12 @@ int sus_path_add_hidden(const char *path)
 
 /* Whether the path-based layer actually installed: both hooks must be patched, or stat and open
  * would disagree with each other. */
+/* The name is kept because the layer table and susfs_control_node_allowed() ask it, but there
+ * is no LSM hook behind it any more: the layer hides with whiteouts, which
+ * sus_path_whiteout_install() reports through n_whiteout_fail. */
 bool sus_path_lsm_active(void)
 {
-	return sus_path_getattr_hook.entry && sus_path_perm_hook.entry;
+	return true;
 }
 
 int sus_path_init(void)
@@ -2584,67 +2680,18 @@ int sus_path_init(void)
         return 0;
     }
 
-    /* LSM hooks: reject path-based access to registered inodes outright.  These two ARE the
-     * mechanism - a registered path is hidden only because this layer answers ENOENT.  A failure
-     * here used to be a warning with a zero return, so add_sus_path() reported success while
-     * nothing was hidden; loading now fails instead. */
-    rc = ksu_register_lsm_hook(&sus_path_getattr_hook);
-    if (rc) {
-        pr_err("sus_path: getattr hook failed %d - nothing would be hidden, refusing to load\n", rc);
-        /* The scratch buffer is already allocated; the caller is about to fail the load, and a
-         * vmalloc'd buffer is not part of the module's own memory, so nobody else would free it. */
-        kvfree(dirent_tmp);
-        dirent_tmp = NULL;
-        return rc;
-    }
-    SUSFS_LOGI("sus_path: getattr hook inserted ahead of the chain (node %px)\n",
-            (void *)sus_path_getattr_hook.entry);
-
-    rc = ksu_register_lsm_hook(&sus_path_perm_hook);
-    if (rc) {
-        pr_err("sus_path: perm hook failed %d - nothing would be hidden, refusing to load\n", rc);
-        ksu_unregister_lsm_hook(&sus_path_getattr_hook);
-        kvfree(dirent_tmp);
-        dirent_tmp = NULL;
-        return rc;
-    }
-    SUSFS_LOGI("sus_path: perm hook inserted ahead of the chain (node %px)\n",
-            (void *)sus_path_perm_hook.entry);
-
-    /* Name-based and metadata operations: without these an app that can write the parent directory
-     * can delete or rename a hidden file, and a hidden file can still be probed or modified through
-     * statfs/xattr/inotify - or answered with EPERM/EACCES, which says it exists. */
-    {
-        struct ksu_lsm_hook *extra[] = {
-            &sus_path_unlink_hook, &sus_path_rmdir_hook,
-            &sus_path_rename_hook, &sus_path_link_hook,
-            &sus_path_statfs_hook, &sus_path_setattr_hook,
-            &sus_path_getxattr_hook, &sus_path_listxattr_hook,
-            &sus_path_setxattr_hook, &sus_path_removexattr_hook,
-            &sus_path_notify_hook,
-        };
-        int i;
-
-        for (i = 0; i < (int)ARRAY_SIZE(extra); i++) {
-            rc = ksu_register_lsm_hook(extra[i]);
-            if (rc) {
-                /* Not fatal - the core two hooks are up, so a hidden path is still hidden -
-                 * but one class of operation is NOT covered, so it is counted and named in
-                 * hide_list rather than only logged. */
-                if (!n_lsm_ext_fail)
-                    first_lsm_ext_fail = extra[i]->head_name;
-                n_lsm_ext_fail++;
-                pr_warn("sus_path: %s hook failed %d - that operation will not be covered\n",
-                        extra[i]->head_name, rc);
-            } else {
-                SUSFS_LOGI("sus_path: %s hook inserted ahead of the chain (node %px)\n",
-                        extra[i]->head_name, (void *)extra[i]->entry);
-            }
-        }
-        if (n_lsm_ext_fail)
-            pr_warn("sus_path: %d/%d secondary hooks failed (first: %s)\n",
-                    n_lsm_ext_fail, (int)ARRAY_SIZE(extra), first_lsm_ext_fail);
-    }
+    /* try/dcache-whiteout: hiding is no longer an LSM decision.  The rule's whiteout - a
+     * negative dentry under the real (parent, name) - is what makes every lookup of the name
+     * fail, so nothing is registered in the LSM chain here.  The privileged bypass in
+     * susfs_or_entry.c opens the rule's object directly, and that is the only path still
+     * usable for a hidden name; every other syscall, for every caller, answers ENOENT out of
+     * the dcache without this module running any code.
+     *
+     * The name-based and xattr hooks that used to live here are gone for the same reason:
+     * with no positive dentry in the dcache, unlink/rename/chmod/xattr/inotify_add_watch fail
+     * at lookup before any of them could matter.  Those operations are deliberately NOT
+     * bypassed - a hidden object is read/write through the bypass, not deletable or
+     * renameable. */
 
     /* The DAC probes, the syscall-entry kprobes and the path-string probes are DELETED, not
      * merely disabled: the mode relax in sus_path_relax_mode() covers the case where DAC
@@ -2723,26 +2770,8 @@ void sus_path_exit(void)
     mutex_unlock(&sus_path_pending_lock);
     /* No walk can be in flight now, so the borrowed creds are ours to release. */
     sus_path_drop_caller_cred();
-    if (sus_path_perm_hook.entry)
-        ksu_unregister_lsm_hook(&sus_path_perm_hook);
-    {
-        struct ksu_lsm_hook *extra[] = {
-            &sus_path_unlink_hook, &sus_path_rmdir_hook,
-            &sus_path_rename_hook, &sus_path_link_hook,
-            &sus_path_statfs_hook, &sus_path_setattr_hook,
-            &sus_path_getxattr_hook, &sus_path_listxattr_hook,
-            &sus_path_setxattr_hook, &sus_path_removexattr_hook,
-            &sus_path_notify_hook,
-        };
-        int i;
-
-        for (i = 0; i < (int)ARRAY_SIZE(extra); i++) {
-            if (extra[i]->entry)
-                ksu_unregister_lsm_hook(extra[i]);
-        }
-    }
-    if (sus_path_getattr_hook.entry)
-        ksu_unregister_lsm_hook(&sus_path_getattr_hook);
+    /* try/dcache-whiteout: nothing in the LSM chain to take down - the whiteouts go with the
+     * rules in the release loop below. */
 
     kvfree(dirent_tmp);
     dirent_tmp = NULL;
