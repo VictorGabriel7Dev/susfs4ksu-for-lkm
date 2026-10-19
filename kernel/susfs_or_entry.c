@@ -300,7 +300,7 @@ static __nocfi noinline long or_newfstatat(const struct pt_regs *regs)
 	/* The saved path was resolved at registration, so the caller's AT_SYMLINK_NOFOLLOW does
 	 * not apply: the rule's object is what the name stands for. */
 	memset(&st, 0, sizeof(st));
-	res = vfs_getattr(&target, &st, STATX_ALL, 0);
+	res = vfs_getattr(&target, &st, STATX_BASIC_STATS, 0);
 	path_put(&target);
 	if (res)
 		return res;
