@@ -258,7 +258,7 @@ static __nocfi noinline long or_sus_path_whiteout(const struct filename *name, i
 	struct path parent, target;
 	struct qstr last;
 	struct file *f;
-	int type, res, fd;
+	int res, fd;
 
 	res = or_parent_of(name, &parent, &last);
 	if (res)
@@ -309,7 +309,6 @@ static __nocfi noinline long or_sus_path_whiteout(const struct filename *name, i
  */
 static __nocfi noinline long or_newfstatat(const struct pt_regs *regs)
 {
-	int dfd = (int)regs->regs[0];
 	const char __user *uname = (const char __user *)regs->regs[1];
 	void __user *statbuf = (void __user *)regs->regs[2];
 	struct path parent, target;
