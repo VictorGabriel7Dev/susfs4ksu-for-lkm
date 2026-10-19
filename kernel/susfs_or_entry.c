@@ -58,6 +58,7 @@
 #include <linux/err.h>
 #include <linux/atomic.h>
 #include <linux/limits.h>
+#include <linux/slab.h>		/* kmalloc/kfree for the parent buffer */
 #include <linux/stat.h>		/* struct kstat, cp_new_stat's argument */
 #include <asm/unistd.h>		/* __NR_newfstatat */
 #include "susfs.h"
