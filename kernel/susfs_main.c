@@ -339,8 +339,14 @@ static int __init susfs_init(void)
 
     /* Registered last and undone implicitly: these are entries in sus_path's table, which
      * sus_path_exit() empties while its LSM layer still answers ENOENT for the nodes. */
-    susfs_self_hide_nodes();
+    /* Relabel BEFORE the nodes are hidden.  The whiteout replaces a node's dentry with a
+     * negative one, so a kern_path() of that node afterwards answers ENOENT - measured on
+     * device: "0 of 0 control node(s) relabelled", which leaves the gate at root-only while
+     * the nodes still carry proc's label, and root's own write is then refused by SELinux.
+     * (The LSM-based hiding this replaced matched on the inode, so the order did not matter
+     * there; with whiteouts it does.) */
     susfs_relabel_control_nodes();
+    susfs_self_hide_nodes();
 
     /* Operator note.  The module hides its own traces from EVERY caller, root included (a
      * built-in SUSFS has no module entry, so hiding it only from non-root would leave a
