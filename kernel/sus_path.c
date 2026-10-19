@@ -966,6 +966,13 @@ static_assert(__builtin_types_compatible_p(LSM_HOOK_FN_TYPE(inode_link),
 					   typeof(&sus_path_inode_link)),
 	      "inode_link hook signature mismatch");
 
+/* try/dcache-whiteout: none of these hook structs is registered any more - the whiteout replaced
+ * the whole LSM chain.  They are kept for one commit so the diff stays readable, and are removed
+ * together with their handlers once the bypass lands.  The pragma is scoped to this block so a
+ * real unused variable elsewhere still fails the build. */
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunused-variable"
+
 static struct ksu_lsm_hook sus_path_unlink_hook =
 	KSU_LSM_HOOK_INSERT(inode_unlink, (void *)sus_path_inode_unlink);
 
@@ -1187,6 +1194,8 @@ static struct ksu_lsm_hook sus_path_getattr_hook =
 
 static struct ksu_lsm_hook sus_path_perm_hook =
 	KSU_LSM_HOOK_INSERT(inode_permission, (void *)sus_path_inode_permission);
+
+#pragma clang diagnostic pop
 
 static atomic_t n_enoent_getattr = ATOMIC_INIT(0);
 static atomic_t n_enoent_perm = ATOMIC_INIT(0);
