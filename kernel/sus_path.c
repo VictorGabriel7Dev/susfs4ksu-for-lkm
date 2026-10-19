@@ -157,6 +157,8 @@ static atomic_t n_whiteout_fail = ATOMIC_INIT(0);
 static unsigned int sus_path_count;
 static struct list_head sus_path_list;
 static spinlock_t sus_path_lock;
+static inline bool sus_path_entry_gate_inode(const struct sus_path_entry *e,
+                                             struct inode *inode);
 
 /* ---- dcache whiteout ----
  *
