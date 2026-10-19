@@ -396,6 +396,7 @@ __nocfi long susfs_opath_post_fd(long ret)
 		 * whichever of the two produced it (and a negative errno passes straight through	\
 		 * that function, which leaves anything that is not an fd alone). */		\
 		if (or_hook) {						\
+			pr_info("susfs_opath: or_hook kind=%d\n", (kind));	\
 			ret = or_hook(regs, (kind));			\
 			if (ret != SUSFS_OR_ENTRY_PASS) {		\
 				if ((flags_reg) >= 0 && ret >= 0 &&	\

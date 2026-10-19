@@ -369,6 +369,7 @@ static __nocfi noinline long or_newfstatat(const struct pt_regs *regs)
 
 static __nocfi noinline long or_entry_redirect(const struct pt_regs *regs, int kind)
 {
+	pr_info("or_entry: redirect enter kind=%d\n", kind);
 	const char __user *uname = NULL;
 	unsigned long flags = 0, mode = 0, resolve = 0, usize = 0, o2flags = 0;
 	/* The descriptor's own flag, kept out of the narrowing the file flags go through: the kernel
