@@ -137,6 +137,10 @@ static unsigned int or_lookup_flags(unsigned long flags, unsigned long resolve)
 static struct filename *(*or_getname_flags_fn)(const char __user *name, int flags, int *empty);
 static int (*or_filename_lookup_fn)(int dfd, struct filename *name, unsigned flags,
 				    struct path *path, struct path *root);
+/* try/dcache-whiteout: stops one component short, so the whiteout is never in the way. */
+static int (*or_filename_parentat_fn)(int dfd, struct filename *name, unsigned int flags,
+				      struct path *parent, struct qstr *last, int *type,
+				      struct filename **res);
 static void (*or_putname_fn)(struct filename *name);
 static struct file *(*or_filp_open_fn)(const char *name, int flags, umode_t mode);
 static int (*or_get_unused_fd_flags_fn)(unsigned flags);
@@ -189,6 +193,66 @@ static __nocfi noinline void or_put_unused_fd(unsigned int fd)
  * function this ends up in - the opath wrapper - and a checked indirect call into the kernel is a
  * panic rather than an error return.  This is also why every kernel function above is held in a
  * plain pointer and called from here, never from the wrapper itself. */
+/* ---- sus_path whiteout bypass (try/dcache-whiteout) ----
+ *
+ * A rule hid its name with a negative dentry, so any lookup of that name answers ENOENT.  That
+ * is the right answer for every caller the rule hides from, and the wrong one for the caller
+ * that must still reach the object - the same predicate the old inode_permission hook applied.
+ * filename_parentat() stops one component short, so it resolves the parent without ever
+ * touching the whiteout, and the path the rule saved is opened directly.
+ *
+ * O_CREAT is satisfied by the object existing (nothing is created), O_EXCL must fail as it
+ * would for any existing file, and O_TRUNC is applied by hand because dentry_open() stops at
+ * vfs_open(). */
+static long or_sus_path_whiteout(const struct filename *name, int dfd, unsigned long flags,
+				 umode_t mode)
+{
+	struct path parent, target;
+	struct qstr last;
+	struct file *f;
+	int type, res, fd;
+
+	res = or_filename_parentat_fn(dfd, (struct filename *)name, 0, &parent, &last,
+				      &type, NULL);
+	if (res)
+		return SUSFS_OR_ENTRY_PASS;
+	if (!sus_path_whiteout_lookup(parent.dentry, &last, &target)) {
+		path_put(&parent);
+		return SUSFS_OR_ENTRY_PASS;
+	}
+	path_put(&parent);
+
+	if ((flags & (O_CREAT | O_EXCL)) == (O_CREAT | O_EXCL)) {
+		path_put(&target);
+		return -EEXIST;
+	}
+	fd = or_get_unused_fd_flags_fn((unsigned)(flags & O_CLOEXEC));
+	if (fd < 0) {
+		path_put(&target);
+		return fd;
+	}
+	f = dentry_open(&target, (int)((flags & ~O_CLOEXEC) | O_LARGEFILE), current_cred());
+	path_put(&target);
+	if (IS_ERR(f)) {
+		or_put_unused_fd_fn((unsigned)fd);
+		return PTR_ERR(f);
+	}
+	if (flags & O_TRUNC) {
+		struct path tp = f->f_path;
+
+		path_get(&tp);
+		res = vfs_truncate(&tp, 0);
+		path_put(&tp);
+		if (res) {
+			fput(f);
+			or_put_unused_fd_fn((unsigned)fd);
+			return res;
+		}
+	}
+	or_fd_install_fn((unsigned)fd, f);
+	return fd;
+}
+
 static __nocfi noinline long or_entry_redirect(const struct pt_regs *regs, int kind)
 {
 	const char __user *uname = NULL;
@@ -380,6 +444,17 @@ static __nocfi noinline long or_entry_redirect(const struct pt_regs *regs, int k
 	name = or_getname_flags_fn(uname, 0, NULL);
 	if (IS_ERR(name))
 		return SUSFS_OR_ENTRY_PASS;
+	/* sus_path whiteout bypass: a rule saved the object's path, so this can answer without
+	 * resolving the name the rule itself hid.  Only for the callers the rule is visible to;
+	 * everyone else falls through and gets the kernel's ENOENT from the dcache. */
+	{
+		long brc = or_sus_path_whiteout(name, dfd, flags, mode);
+
+		if (brc != SUSFS_OR_ENTRY_PASS) {
+			or_putname_fn(name);
+			return brc;
+		}
+	}
 	res = or_filename_lookup_fn(dfd, name, or_lookup_flags(flags, resolve), &path, NULL);
 	or_putname_fn(name);
 	if (res)
@@ -464,6 +539,9 @@ int susfs_or_entry_init(void)
 
 	or_getname_flags_fn = (void *)find_kernel_symbol_exact("getname_flags");
 	or_filename_lookup_fn = (void *)find_kernel_symbol_exact("filename_lookup");
+	/* try/dcache-whiteout: the whiteout bypass resolves the parent with this; open_redirect
+	 * itself does not need it, but the bypass is useless without it. */
+	or_filename_parentat_fn = (void *)find_kernel_symbol_exact("filename_parentat");
 	or_putname_fn = (void *)find_kernel_symbol_exact("putname");
 	or_filp_open_fn = (void *)find_kernel_symbol_exact("filp_open");
 	or_get_unused_fd_flags_fn = (void *)find_kernel_symbol_exact("get_unused_fd_flags");
@@ -484,7 +562,7 @@ int susfs_or_entry_init(void)
 
 	if (!or_getname_flags_fn || !or_filename_lookup_fn || !or_putname_fn ||
 	    !or_filp_open_fn || !or_get_unused_fd_flags_fn || !or_fd_install_fn ||
-	    !or_put_unused_fd_fn) {
+	    !or_put_unused_fd_fn || !or_filename_parentat_fn) {
 		SUSFS_LOGI("or_entry: not armed, a symbol is missing (getname_flags=%d filename_lookup=%d putname=%d filp_open=%d get_unused_fd_flags=%d fd_install=%d put_unused_fd=%d) - open_redirect will refuse rules\n",
 			   !!or_getname_flags_fn, !!or_filename_lookup_fn, !!or_putname_fn,
 			   !!or_filp_open_fn, !!or_get_unused_fd_flags_fn, !!or_fd_install_fn,

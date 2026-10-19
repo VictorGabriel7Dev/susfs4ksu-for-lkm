@@ -200,8 +200,11 @@ static void sus_path_whiteout_remove(struct sus_path_entry *e)
     }
 }
 
-/* The open bypass asks this with the name already resolved to (parent, last).  The path is
- * reference-counted under the lock, so the caller can use it after unlocking. */
+/* The open bypass asks this with the name already resolved to (parent, last).  A rule whose
+ * gate hides the caller is skipped: for those callers the kernel's own lookup is the answer,
+ * and it says ENOENT because the whiteout is in the dcache.  Only the callers the rule is
+ * visible to get a path back.  The path is reference-counted under the lock, so it stays valid
+ * after unlocking. */
 bool sus_path_whiteout_lookup(struct dentry *parent, const struct qstr *name,
                               struct path *out)
 {
@@ -218,6 +221,8 @@ bool sus_path_whiteout_lookup(struct dentry *parent, const struct qstr *name,
             e->whiteout_src.dentry->d_name.hash != name->hash ||
             e->whiteout_src.dentry->d_name.len != name->len ||
             memcmp(e->whiteout_src.dentry->d_name.name, name->name, name->len))
+            continue;
+        if (sus_path_entry_gate_inode(e, e->inode))	/* hidden from this caller */
             continue;
         *out = e->whiteout_src;
         path_get(out);
