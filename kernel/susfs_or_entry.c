@@ -392,8 +392,11 @@ static __nocfi noinline long or_entry_redirect(const struct pt_regs *regs, int k
 	/* This hook is reached for every open() on the system, so the empty case has to be one load: no
 	 * live rules means nothing to resolve a name for, and deleting the last rule takes that cost away
 	 * again (susfs_open_redirect_rules counts live rules, not rules ever added). */
-	if (!susfs_open_redirect_active())
-		return SUSFS_OR_ENTRY_PASS;
+	/* The empty-table fast path is NOT taken here any more: the sus_path whiteout bypass
+	 * below answers independently of the open_redirect rule table, and returning early
+	 * would hide every whiteout behind an empty redirect table - measured on device as
+	 * "redirect enter" running while whiteout_count stayed 0.  The check moved to just
+	 * after the bypass call. */
 
 	/* arm64 keeps a syscall's arguments in regs[0..5] for native and compat alike, so the
 	 * argument number IS the register index (arch/arm64/include/asm/syscall_wrapper.h). */
@@ -569,6 +572,12 @@ static __nocfi noinline long or_entry_redirect(const struct pt_regs *regs, int k
 			or_putname_fn(name);
 			return brc;
 		}
+	}
+	/* Only now does the open_redirect table matter: the bypass above answered any whiteout
+	 * rule, and an empty redirect table must not short-circuit it. */
+	if (!susfs_open_redirect_active()) {
+		or_putname_fn(name);
+		return SUSFS_OR_ENTRY_PASS;
 	}
 	res = or_filename_lookup_fn(dfd, name, or_lookup_flags(flags, resolve), &path, NULL);
 	or_putname_fn(name);
