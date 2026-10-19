@@ -153,6 +153,9 @@ static atomic_t n_iop_arm_fail = ATOMIC_INIT(0);
  * but the name stays visible, and nothing else would say so. */
 static atomic_t n_whiteout_fail = ATOMIC_INIT(0);
 
+/* Defined with the rule table further down; the whiteout lookup below is its first user. */
+static atomic_t sus_path_count;
+
 /* ---- dcache whiteout ----
  *
  * Hiding moves out of the LSM chain and into one dcache entry.  The real dentry is dropped
