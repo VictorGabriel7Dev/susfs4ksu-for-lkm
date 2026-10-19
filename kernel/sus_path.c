@@ -213,16 +213,27 @@ bool sus_path_whiteout_lookup(struct dentry *parent, const struct qstr *name,
     struct sus_path_entry *e;
     bool found = false;
 
-    if (!READ_ONCE(sus_path_count) || !parent || !name)
+    if (!READ_ONCE(sus_path_count) || !parent || !name) {
+        pr_info("sus_path: whiteout lookup skipped count=%u parent=%d name=%d\n",
+                READ_ONCE(sus_path_count), !!parent, !!name);
         return false;
+    }
     spin_lock(&sus_path_lock);
     list_for_each_entry(e, &sus_path_list, list) {
-        if (!e->whiteout || !e->whiteout_src.dentry)
+        bool name_ok;
+
+        if (!e->whiteout || !e->whiteout_src.dentry) {
+            pr_info("sus_path: whiteout rule %s has no whiteout installed\n", e->path);
             continue;
-        if (e->whiteout_src.dentry->d_parent != parent ||
-            e->whiteout_src.dentry->d_name.hash != name->hash ||
-            e->whiteout_src.dentry->d_name.len != name->len ||
-            memcmp(e->whiteout_src.dentry->d_name.name, name->name, name->len))
+        }
+        name_ok = e->whiteout_src.dentry->d_name.len == name->len &&
+                  !memcmp(e->whiteout_src.dentry->d_name.name, name->name, name->len);
+        pr_info("sus_path: whiteout cmp %s: parent=%s name=%s (rule_parent=%px got=%px)\n",
+                e->path,
+                e->whiteout_src.dentry->d_parent == parent ? "same" : "DIFF",
+                name_ok ? "same" : "DIFF",
+                e->whiteout_src.dentry->d_parent, parent);
+        if (e->whiteout_src.dentry->d_parent != parent || !name_ok)
             continue;
         if (sus_path_entry_gate_inode(e, e->inode)) {	/* hidden from this caller */
             pr_info("sus_path: whiteout gate hides %.*s (self_protect=%d)\n",
