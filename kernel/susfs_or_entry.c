@@ -213,28 +213,40 @@ static __nocfi noinline void or_put_unused_fd(unsigned int fd)
  * caller's own fallthrough answer is the correct one anyway. */
 static int or_parent_of(const struct filename *name, struct path *parent, struct qstr *last)
 {
-	char buf[PATH_MAX];
 	const char *full = name->name;
-	char *slash;
+	char *buf, *slash;
 	size_t len;
+	int res;
 
 	if (!full || full[0] != '/')
 		return -EINVAL;
 	len = strlen(full);
-	if (len >= sizeof(buf) || len < 2)
+	if (len < 2 || len >= PATH_MAX)
 		return -ENAMETOOLONG;
+	/* Heap, not a PATH_MAX local: a 4096-byte frame trips the 2048-byte stack warning the
+	 * build gates on.  Process context here, so GFP_KERNEL is fine. */
+	buf = kmalloc(len + 1, GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
 	memcpy(buf, full, len + 1);
 	slash = strrchr(buf, '/');
-	if (!slash || !slash[1])
+	if (!slash || !slash[1]) {
+		kfree(buf);
 		return -EINVAL;
+	}
+	/* last->name points into the caller's string, not into the copy about to be freed. */
 	last->name = full + (size_t)(slash - buf) + 1;
 	last->len = (u32)strlen(slash + 1);
-	if (last->len > NAME_MAX)
+	if (last->len > NAME_MAX) {
+		kfree(buf);
 		return -ENAMETOOLONG;
+	}
 	*slash = '\0';
 	if (!buf[0])
-		strscpy(buf, "/", sizeof(buf));
-	return kern_path(buf, LOOKUP_FOLLOW, parent);
+		strscpy(buf, "/", len + 1);
+	res = kern_path(buf, LOOKUP_FOLLOW, parent);
+	kfree(buf);
+	return res;
 }
 
 /* ---- sus_path whiteout bypass (try/dcache-whiteout) ----
