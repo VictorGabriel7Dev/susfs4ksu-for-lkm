@@ -208,53 +208,148 @@ static __nocfi noinline void or_put_unused_fd(unsigned int fd)
  * function this ends up in - the opath wrapper - and a checked indirect call into the kernel is a
  * panic rather than an error return.  This is also why every kernel function above is held in a
  * plain pointer and called from here, never from the wrapper itself. */
+/* Lexically normalize an absolute path: "/a/./b/../c" -> "/a/c".  No lookup, no dcache. */
+static int or_normalize_path(char *out, size_t outsz, const char *in)
+{
+	size_t o = 1;
+	const char *p = in;
+
+	if (outsz < 2)
+		return -ENAMETOOLONG;
+	out[0] = '/';
+	out[1] = '\0';
+	while (*p) {
+		const char *seg;
+		size_t len;
+
+		while (*p == '/')
+			p++;
+		if (!*p)
+			break;
+		seg = p;
+		while (*p && *p != '/')
+			p++;
+		len = (size_t)(p - seg);
+		if (len == 1 && seg[0] == '.')
+			continue;
+		if (len == 2 && seg[0] == '.' && seg[1] == '.') {
+			while (o > 1 && out[o - 1] != '/')
+				o--;
+			if (o > 1)
+				o--;
+			out[o] = '\0';
+			continue;
+		}
+		if (o + len + 2 > outsz)
+			return -ENAMETOOLONG;
+		if (o > 1)
+			out[o++] = '/';
+		memcpy(out + o, seg, len);
+		o += len;
+		out[o] = '\0';
+	}
+	return 0;
+}
+
+/* Resolve a relative name the way the kernel would: take the caller's cwd, join the string and
+ * normalize it lexically, then resolve only the PARENT of the result.  The last component is
+ * never looked up, so the whiteout cannot answer for it, and nothing is cached back into the
+ * dcache - the absolute form is returned for the rule match only. */
+static __nocfi noinline int or_normalize_rel(const struct filename *name, char **full_out,
+					      struct path *parent, struct qstr *last)
+{
+	struct path cwd;
+	char *cwd_buf, *tmp, *norm, *p, *slash;
+	size_t len;
+	int res;
+
+	res = kern_path(".", LOOKUP_FOLLOW, &cwd);
+	if (res)
+		return res;
+	cwd_buf = kmalloc(PATH_MAX, GFP_KERNEL);
+	tmp = kmalloc(2 * PATH_MAX, GFP_KERNEL);
+	norm = kmalloc(PATH_MAX, GFP_KERNEL);
+	if (!cwd_buf || !tmp || !norm) {
+		res = -ENOMEM;
+		goto out;
+	}
+	p = d_path(&cwd, cwd_buf, PATH_MAX);
+	path_put(&cwd);
+	if (IS_ERR(p)) {
+		res = PTR_ERR(p);
+		goto out;
+	}
+	if (p[0] != '/') {
+		res = -EINVAL;
+		goto out;
+	}
+	if (!strcmp(p, "/"))
+		scnprintf(tmp, 2 * PATH_MAX, "/%s", name->name);
+	else
+		scnprintf(tmp, 2 * PATH_MAX, "%s/%s", p, name->name);
+	res = or_normalize_path(norm, PATH_MAX, tmp);
+	if (res)
+		goto out;
+	len = strlen(norm);
+	if (len < 2 || len >= PATH_MAX) {
+		res = -ENAMETOOLONG;
+		goto out;
+	}
+	slash = strrchr(norm, '/');
+	if (!slash || !slash[1]) {
+		res = -EINVAL;
+		goto out;
+	}
+	last->name = slash + 1;
+	last->len = (u32)strlen(slash + 1);
+	if (last->len > NAME_MAX) {
+		res = -ENAMETOOLONG;
+		goto out;
+	}
+	if (slash == norm) {
+		res = kern_path("/", LOOKUP_FOLLOW, parent);
+	} else {
+		*slash = '\0';
+		res = kern_path(norm, LOOKUP_FOLLOW, parent);
+		*slash = '/';
+	}
+	if (res)
+		goto out;
+	*full_out = norm;
+	norm = NULL;
+	res = 0;
+out:
+	kfree(cwd_buf);
+	kfree(tmp);
+	kfree(norm);
+	return res;
+}
+
 /* Resolve the parent of a path without ever touching the last component.
  *
  * filename_parentat() would be the obvious primitive, but it is inlined on this kernel and not
- * in kallsyms - adding it to the required set is what left the whole open bypass unarmed
- * ("not armed, a symbol is missing").  Absolute paths split the string and resolve the
- * directory; relative paths ask the kernel for the parent (filename_lookup() with
- * LOOKUP_PARENT), which resolves them against the caller's dfd/cwd without ever looking up
- * the last component.  Either way the hidden name is never looked up, so the whiteout cannot
- * answer for it. */
-static __nocfi noinline int or_parent_of(const struct filename *name, int dfd, struct path *parent, struct qstr *last)
+ * in kallsyms, and filename_lookup() is not a substitute: it walks the last component too, so
+ * the whiteout answers ENOENT before the bypass can run (measured on device).  Absolute paths
+ * split the string and resolve the directory; relative paths are joined with the cwd and
+ * normalized lexically (or_normalize_rel), then resolved the same way.  The absolute form is
+ * returned so a rule can be matched across mount namespaces, where the parent dentry differs.
+ * Either way the hidden name is never looked up. */
+static __nocfi noinline int or_parent_of(const struct filename *name, int dfd,
+					 struct path *parent, struct qstr *last,
+					 char **full_out)
 {
 	const char *full = name->name;
 	char *buf, *slash;
 	size_t len;
 	int res;
 
+	*full_out = NULL;
 	if (!full || !full[0])
 		return -EINVAL;
 	if (full[0] != '/') {
-		const char *end, *p;
-
-		if (!or_filename_lookup_fn)
+		if (dfd != AT_FDCWD)
 			return -EOPNOTSUPP;
-		res = or_filename_lookup_fn(dfd, (struct filename *)name,
-					    LOOKUP_PARENT | LOOKUP_FOLLOW, parent, NULL);
-		if (res)
-			return res;
-		len = strlen(full);
-		end = full + len;
-		while (end > full && end[-1] == '/')
-			end--;
-		p = end;
-		while (p > full && p[-1] != '/')
-			p--;
-		if (p == end ||
-		    (end - p == 1 && p[0] == '.') ||
-		    (end - p == 2 && p[0] == '.' && p[1] == '.')) {
-			path_put(parent);
-			return -EINVAL;
-		}
-		last->name = p;
-		last->len = (u32)(end - p);
-		if (last->len > NAME_MAX) {
-			path_put(parent);
-			return -ENAMETOOLONG;
-		}
-		return 0;
+		return or_normalize_rel(name, full_out, parent, last);
 	}
 	len = strlen(full);
 	if (len < 2 || len >= PATH_MAX)
@@ -305,6 +400,7 @@ static __nocfi noinline long or_sus_path_whiteout(const struct filename *name, i
 {
 	struct path parent, target;
 	struct qstr last;
+	char *norm = NULL;
 	struct file *f;
 	int res, fd;
 
@@ -313,15 +409,17 @@ static __nocfi noinline long or_sus_path_whiteout(const struct filename *name, i
 	if (!sus_path_whiteout_armed())
 		return SUSFS_OR_ENTRY_PASS;
 
-	res = or_parent_of(name, dfd, &parent, &last);
+	res = or_parent_of(name, dfd, &parent, &last, &norm);
 	if (res) {
 		return SUSFS_OR_ENTRY_PASS;
 	}
-	if (!sus_path_whiteout_lookup(parent.dentry, &last, name->name, &target)) {
+	if (!sus_path_whiteout_lookup(parent.dentry, &last, norm ? norm : name->name, &target)) {
 		path_put(&parent);
+		kfree(norm);
 		return SUSFS_OR_ENTRY_PASS;
 	}
 	path_put(&parent);
+	kfree(norm);
 
 	if ((flags & (O_CREAT | O_EXCL)) == (O_CREAT | O_EXCL)) {
 		path_put(&target);
@@ -369,6 +467,7 @@ static __nocfi noinline long or_newfstatat(const struct pt_regs *regs)
 	struct filename *name;
 	struct qstr last;
 	struct kstat st;
+	char *norm = NULL;
 	int res;
 
 	if (!or_cp_new_stat_fn)
@@ -376,17 +475,19 @@ static __nocfi noinline long or_newfstatat(const struct pt_regs *regs)
 	name = or_getname_flags_fn(uname, 0, NULL);
 	if (IS_ERR(name))
 		return or_newfstatat_hook.orig(regs);
-	res = or_parent_of(name, (int)regs->regs[0], &parent, &last);
+	res = or_parent_of(name, (int)regs->regs[0], &parent, &last, &norm);
 	if (res) {
 		or_putname_fn(name);
 		return or_newfstatat_hook.orig(regs);
 	}
-	if (!sus_path_whiteout_lookup(parent.dentry, &last, name->name, &target)) {
+	if (!sus_path_whiteout_lookup(parent.dentry, &last, norm ? norm : name->name, &target)) {
 		path_put(&parent);
 		or_putname_fn(name);
+		kfree(norm);
 		return or_newfstatat_hook.orig(regs);
 	}
 	path_put(&parent);
+	kfree(norm);
 	/* The saved path was resolved at registration, so the caller's AT_SYMLINK_NOFOLLOW does
 	 * not apply: the rule's object is what the name stands for. */
 	memset(&st, 0, sizeof(st));
@@ -414,6 +515,7 @@ static __nocfi noinline long or_statx(const struct pt_regs *regs)
 	struct filename *name;
 	struct qstr last;
 	struct kstat st;
+	char *norm = NULL;
 	int res;
 
 	if (!or_cp_statx_fn || !sus_path_whiteout_armed())
@@ -421,17 +523,19 @@ static __nocfi noinline long or_statx(const struct pt_regs *regs)
 	name = or_getname_flags_fn(uname, 0, NULL);
 	if (IS_ERR(name))
 		return or_statx_hook.orig(regs);
-	res = or_parent_of(name, (int)regs->regs[0], &parent, &last);
+	res = or_parent_of(name, (int)regs->regs[0], &parent, &last, &norm);
 	if (res) {
 		or_putname_fn(name);
 		return or_statx_hook.orig(regs);
 	}
-	if (!sus_path_whiteout_lookup(parent.dentry, &last, name->name, &target)) {
+	if (!sus_path_whiteout_lookup(parent.dentry, &last, norm ? norm : name->name, &target)) {
 		path_put(&parent);
 		or_putname_fn(name);
+		kfree(norm);
 		return or_statx_hook.orig(regs);
 	}
 	path_put(&parent);
+	kfree(norm);
 	memset(&st, 0, sizeof(st));
 	res = vfs_getattr(&target, &st, mask, sflags);
 	path_put(&target);
@@ -457,6 +561,7 @@ static __nocfi noinline long or_readlinkat(const struct pt_regs *regs)
 	struct path parent, target;
 	struct filename *name;
 	struct qstr last;
+	char *norm = NULL;
 	int res;
 
 	if (!or_vfs_readlink_fn || !sus_path_whiteout_armed())
@@ -464,17 +569,19 @@ static __nocfi noinline long or_readlinkat(const struct pt_regs *regs)
 	name = or_getname_flags_fn(uname, 0, NULL);
 	if (IS_ERR(name))
 		return or_readlinkat_hook.orig(regs);
-	res = or_parent_of(name, (int)regs->regs[0], &parent, &last);
+	res = or_parent_of(name, (int)regs->regs[0], &parent, &last, &norm);
 	if (res) {
 		or_putname_fn(name);
 		return or_readlinkat_hook.orig(regs);
 	}
-	if (!sus_path_whiteout_lookup(parent.dentry, &last, name->name, &target)) {
+	if (!sus_path_whiteout_lookup(parent.dentry, &last, norm ? norm : name->name, &target)) {
 		path_put(&parent);
 		or_putname_fn(name);
+		kfree(norm);
 		return or_readlinkat_hook.orig(regs);
 	}
 	path_put(&parent);
+	kfree(norm);
 	res = or_vfs_readlink_fn(target.dentry, buf, buflen);
 	path_put(&target);
 	or_putname_fn(name);
