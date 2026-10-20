@@ -208,25 +208,54 @@ static __nocfi noinline void or_put_unused_fd(unsigned int fd)
  * function this ends up in - the opath wrapper - and a checked indirect call into the kernel is a
  * panic rather than an error return.  This is also why every kernel function above is held in a
  * plain pointer and called from here, never from the wrapper itself. */
-/* Resolve the parent of an absolute path without ever touching the last component.
+/* Resolve the parent of a path without ever touching the last component.
  *
  * filename_parentat() would be the obvious primitive, but it is inlined on this kernel and not
  * in kallsyms - adding it to the required set is what left the whole open bypass unarmed
- * ("not armed, a symbol is missing").  Splitting the string and resolving the directory has
- * the same property that matters: the hidden name is never looked up, so the whiteout cannot
- * answer for it.
- *
- * Relative paths are left to the kernel: resolving them would need the caller's cwd, and the
- * caller's own fallthrough answer is the correct one anyway. */
-static int or_parent_of(const struct filename *name, struct path *parent, struct qstr *last)
+ * ("not armed, a symbol is missing").  Absolute paths split the string and resolve the
+ * directory; relative paths ask the kernel for the parent (filename_lookup() with
+ * LOOKUP_PARENT), which resolves them against the caller's dfd/cwd without ever looking up
+ * the last component.  Either way the hidden name is never looked up, so the whiteout cannot
+ * answer for it. */
+static __nocfi noinline int or_parent_of(const struct filename *name, int dfd, struct path *parent, struct qstr *last)
 {
 	const char *full = name->name;
 	char *buf, *slash;
 	size_t len;
 	int res;
 
-	if (!full || full[0] != '/')
+	if (!full || !full[0])
 		return -EINVAL;
+	if (full[0] != '/') {
+		const char *end, *p;
+
+		if (!or_filename_lookup_fn)
+			return -EOPNOTSUPP;
+		res = or_filename_lookup_fn(dfd, (struct filename *)name,
+					    LOOKUP_PARENT | LOOKUP_FOLLOW, parent, NULL);
+		if (res)
+			return res;
+		len = strlen(full);
+		end = full + len;
+		while (end > full && end[-1] == '/')
+			end--;
+		p = end;
+		while (p > full && p[-1] != '/')
+			p--;
+		if (p == end ||
+		    (end - p == 1 && p[0] == '.') ||
+		    (end - p == 2 && p[0] == '.' && p[1] == '.')) {
+			path_put(parent);
+			return -EINVAL;
+		}
+		last->name = p;
+		last->len = (u32)(end - p);
+		if (last->len > NAME_MAX) {
+			path_put(parent);
+			return -ENAMETOOLONG;
+		}
+		return 0;
+	}
 	len = strlen(full);
 	if (len < 2 || len >= PATH_MAX)
 		return -ENAMETOOLONG;
@@ -284,7 +313,7 @@ static __nocfi noinline long or_sus_path_whiteout(const struct filename *name, i
 	if (!sus_path_whiteout_armed())
 		return SUSFS_OR_ENTRY_PASS;
 
-	res = or_parent_of(name, &parent, &last);
+	res = or_parent_of(name, dfd, &parent, &last);
 	if (res) {
 		return SUSFS_OR_ENTRY_PASS;
 	}
@@ -347,12 +376,14 @@ static __nocfi noinline long or_newfstatat(const struct pt_regs *regs)
 	name = or_getname_flags_fn(uname, 0, NULL);
 	if (IS_ERR(name))
 		return or_newfstatat_hook.orig(regs);
-	res = or_parent_of(name, &parent, &last);
-	or_putname_fn(name);
-	if (res)
+	res = or_parent_of(name, (int)regs->regs[0], &parent, &last);
+	if (res) {
+		or_putname_fn(name);
 		return or_newfstatat_hook.orig(regs);
+	}
 	if (!sus_path_whiteout_lookup(parent.dentry, &last, name->name, &target)) {
 		path_put(&parent);
+		or_putname_fn(name);
 		return or_newfstatat_hook.orig(regs);
 	}
 	path_put(&parent);
@@ -361,6 +392,7 @@ static __nocfi noinline long or_newfstatat(const struct pt_regs *regs)
 	memset(&st, 0, sizeof(st));
 	res = vfs_getattr(&target, &st, STATX_BASIC_STATS, 0);
 	path_put(&target);
+	or_putname_fn(name);
 	if (res)
 		return res;
 	or_cp_new_stat_fn(&st, statbuf);
@@ -389,7 +421,7 @@ static __nocfi noinline long or_statx(const struct pt_regs *regs)
 	name = or_getname_flags_fn(uname, 0, NULL);
 	if (IS_ERR(name))
 		return or_statx_hook.orig(regs);
-	res = or_parent_of(name, &parent, &last);
+	res = or_parent_of(name, (int)regs->regs[0], &parent, &last);
 	if (res) {
 		or_putname_fn(name);
 		return or_statx_hook.orig(regs);
@@ -403,10 +435,12 @@ static __nocfi noinline long or_statx(const struct pt_regs *regs)
 	memset(&st, 0, sizeof(st));
 	res = vfs_getattr(&target, &st, mask, sflags);
 	path_put(&target);
-	or_putname_fn(name);
-	if (res)
+	if (res) {
+		or_putname_fn(name);
 		return res;
+	}
 	or_cp_statx_fn(&st, statxbuf);   /* cp_statx takes the mask from st.result_mask */
+	or_putname_fn(name);
 	return 0;
 }
 
@@ -430,7 +464,7 @@ static __nocfi noinline long or_readlinkat(const struct pt_regs *regs)
 	name = or_getname_flags_fn(uname, 0, NULL);
 	if (IS_ERR(name))
 		return or_readlinkat_hook.orig(regs);
-	res = or_parent_of(name, &parent, &last);
+	res = or_parent_of(name, (int)regs->regs[0], &parent, &last);
 	if (res) {
 		or_putname_fn(name);
 		return or_readlinkat_hook.orig(regs);
