@@ -130,6 +130,10 @@ struct sus_path_entry {
     bool self_protect;
     /* Pre-relax mode, 0 = this rule did not touch it (sus_path_relax_mode()). */
     umode_t orig_mode;
+    /* Registered through CMD_SUSFS_ADD_SUS_PATH_LOOP: the path is re-resolved for the life
+     * of the rule, so replacing the file (a new inode) updates the rule instead of leaving it
+     * pointing at an inode that no longer exists. */
+    bool loop;
 };
 
 /* Defined next to the readlink stub further down, but called from the pending resolver
@@ -186,6 +190,10 @@ static bool sus_path_lifetime_watch;
 /* Rules waiting for their path to appear, counted so every fast path can bail out at
  * once; guarded by sus_path_lock. */
 static atomic_t sus_path_n_pending = ATOMIC_INIT(0);
+/* Rules that must keep being re-resolved (the _LOOP variant).  Kept apart from n_pending:
+ * that one keeps the retry timer armed while a rule has no inode yet, this one also counts
+ * the rules that DO have one and must follow it when it changes. */
+static atomic_t sus_path_n_loop = ATOMIC_INIT(0);
 static unsigned int sus_path_pass_gen;      /* guarded by sus_path_lock */
 static atomic_t sus_path_pending_tries = ATOMIC_INIT(0);
 /* One resolution pass at a time: the supercall and the retry timer would race on the
@@ -227,6 +235,8 @@ static bool sus_path_release_one(struct super_block *sb, const char *path,
     mutex_unlock(&sus_path_lifecycle_lock);
     if (!found)
         return false;
+    if (found->loop)
+        atomic_dec(&sus_path_n_loop);
     if (found->inode) {
         /* Before the reference is dropped: after iput() the inode may be evicted, and
          * the store would be into freed memory.  See sus_path_iop_restore(). */
@@ -2825,6 +2835,9 @@ void sus_path_supercall(unsigned int cmd, void __user **arg)
     sus_path_entry_set_path(e, info.target_pathname);
     if (!inode)
         sus_path_basename(e->path, e->name, sizeof(e->name));
+    e->loop = pending_ok;
+    if (e->loop)
+        atomic_inc(&sus_path_n_loop);
     INIT_LIST_HEAD(&e->list);
     rc = sus_path_publish_entry(e, true);
     if (rc) {
@@ -2832,6 +2845,8 @@ void sus_path_supercall(unsigned int cmd, void __user **arg)
             sus_path_iop_restore(e);
             iput(e->inode);
         }
+        if (e->loop)
+            atomic_dec(&sus_path_n_loop);
         kfree(e);
     }
     if (rc < 0) {
