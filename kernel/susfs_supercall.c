@@ -78,15 +78,11 @@ static const struct feature_entry enabled_features[] = {
 	 * different lifecycle (no load/unload, no /sys/module entry, no module parameters). */
 	{ "SUSFS_LKM_MODULES\n",		NULL },
 	{ "CONFIG_KSU_SUSFS_SUS_PATH\n",	sus_path_lsm_active },
-	{ "CONFIG_KSU_SUSFS_SUS_MOUNT\n",	NULL },
-	{ "CONFIG_KSU_SUSFS_SUS_KSTAT\n",	NULL },
-	{ "CONFIG_KSU_SUSFS_SPOOF_UNAME\n",	NULL },
-	{ "CONFIG_KSU_SUSFS_ENABLE_LOG\n",	NULL },
-	{ "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS\n",	susfs_hide_syms_active },
-	{ "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG\n", NULL },
-	{ "CONFIG_KSU_SUSFS_OPEN_REDIRECT\n",	NULL },
-	{ "CONFIG_KSU_SUSFS_SUS_MAP\n",		NULL },
-	/* hide_modules is not upstream's, so it is not listed here - the feature itself is unchanged. */
+	/* try/dcache-whiteout-lsm-off: only sus_path (and its SUS_PATH_LOOP command) is active
+	 * while the whiteout is under test.  The other features are deliberately not advertised
+	 * and their commands are not handled (see susfs_cmd_handled()); a detector comparing this
+	 * list with /proc/mounts or the layer list must not see a capability this test build does
+	 * not carry. */
 };
 
 /* The -ENOMEM answer for CMD_SUSFS_SHOW_ENABLED_FEATURES is the whole ABI struct (8192-byte
@@ -210,16 +206,11 @@ static bool susfs_cmd_handled(unsigned int cmd)
 	case CMD_SUSFS_SHOW_ENABLED_FEATURES:
 	case CMD_SUSFS_ADD_SUS_PATH:
 	case CMD_SUSFS_ADD_SUS_PATH_LOOP:
-	case CMD_SUSFS_ADD_SUS_MAP:
-	case CMD_SUSFS_ADD_SUS_KSTAT:
-	case CMD_SUSFS_UPDATE_SUS_KSTAT:
-	case CMD_SUSFS_ADD_SUS_KSTAT_STATICALLY:
-	case CMD_SUSFS_SET_UNAME:
-	case CMD_SUSFS_ENABLE_LOG:
-	case CMD_SUSFS_ENABLE_AVC_LOG_SPOOFING:
-	case CMD_SUSFS_SET_CMDLINE_OR_BOOTCONFIG:
-	case CMD_SUSFS_ADD_OPEN_REDIRECT:
-	case CMD_SUSFS_HIDE_SUS_MNTS_FOR_NON_SU_PROCS:
+	/* try/dcache-whiteout-lsm-off: test build.  Only the sus_path commands (plus the three
+	 * read-only SHOW queries needed to observe the layer) are hijacked; every other feature
+	 * command is deliberately left to the kernel, so it answers -EINVAL and userspace's
+	 * ERR_CMD_NOT_SUPPORTED sentinel stays intact.  The switch in susfs_tw_func() keeps the
+	 * rest as unreachable code; no function prototype changes are involved. */
 		return true;
 	default:
 		return false;
