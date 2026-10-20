@@ -2444,8 +2444,16 @@ void sus_path_supercall(unsigned int cmd, void __user **arg)
         pr_warn("sus_path: '%s' reports ino 0 - hidden by inode, but a directory listing cannot be filtered for it\n",
                 info.target_pathname);
     if (have_path) {
-        path_put(&path);
-        have_path = false;
+        /* try/dcache-whiteout: the supercall path used to publish the rule and drop the
+         * reference without installing the whiteout, so a rule added through reboot(2)
+         * answered ENOENT nowhere (measured on device: app could still read it while the
+         * same path added through /proc/susfs_path was hidden).  Same contract as
+         * sus_path_add_hidden_ex(): the rule owns the path on success, the caller keeps it
+         * on failure and counts the miss. */
+        if (sus_path_whiteout_install(e, &path))
+            atomic_inc(&n_whiteout_fail);
+        else
+            have_path = false;
     }
     if (!dirent_tmp) {
         dirent_tmp = kvmalloc(DIRENT_BUF_SIZE, GFP_KERNEL);
