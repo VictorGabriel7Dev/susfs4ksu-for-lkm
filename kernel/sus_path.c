@@ -923,8 +923,6 @@ static void sus_path_pending_work(struct work_struct *w)
  * the old shape of this file had to avoid stays the one to avoid here too: losing the original is
  * FAIL OPEN in the worst place - an operation SELinux denies allowed while every rule still
  * looked installed. */
-static int sus_path_inode_getattr(const struct path *path);
-static int sus_path_inode_permission(struct inode *inode, int mask);
 
 /* The signatures MUST match the LSM hook types exactly, and must NOT be __nocfi:
  * this kernel uses kCFI with cross-module checks, so the call site compares type
@@ -957,12 +955,6 @@ static int sus_path_inode_permission(struct inode *inode, int mask);
 #define SUS_LSM_PASS_ORIG(hook, member, ...) do { } while (0)
 #endif
 
-static_assert(__builtin_types_compatible_p(LSM_HOOK_FN_TYPE(inode_getattr),
-					   typeof(&sus_path_inode_getattr)),
-	      "inode_getattr hook signature mismatch");
-static_assert(__builtin_types_compatible_p(LSM_HOOK_FN_TYPE(inode_permission),
-					   typeof(&sus_path_inode_permission)),
-	      "inode_permission hook signature mismatch");
 
 /* ---- name-based operations ----
  *
@@ -975,364 +967,6 @@ static_assert(__builtin_types_compatible_p(LSM_HOOK_FN_TYPE(inode_permission),
  * also covers a parent directory that itself denies the caller; being after DAC is enough for the case
  * that matters here (a writable parent).  The create family (inode_create/mkdir/mknod/symlink) is
  * deliberately not here: the target does not exist yet, so there is no inode to match against. */
-static int sus_path_inode_unlink(struct inode *dir, struct dentry *dentry);
-static int sus_path_inode_rmdir(struct inode *dir, struct dentry *dentry);
-static int sus_path_inode_rename(struct inode *old_dir, struct dentry *old_dentry,
-				 struct inode *new_dir, struct dentry *new_dentry);
-static int sus_path_inode_link(struct dentry *old_dentry, struct inode *dir,
-			       struct dentry *new_dentry);
-
-static_assert(__builtin_types_compatible_p(LSM_HOOK_FN_TYPE(inode_unlink),
-					   typeof(&sus_path_inode_unlink)),
-	      "inode_unlink hook signature mismatch");
-static_assert(__builtin_types_compatible_p(LSM_HOOK_FN_TYPE(inode_rmdir),
-					   typeof(&sus_path_inode_rmdir)),
-	      "inode_rmdir hook signature mismatch");
-static_assert(__builtin_types_compatible_p(LSM_HOOK_FN_TYPE(inode_rename),
-					   typeof(&sus_path_inode_rename)),
-	      "inode_rename hook signature mismatch");
-static_assert(__builtin_types_compatible_p(LSM_HOOK_FN_TYPE(inode_link),
-					   typeof(&sus_path_inode_link)),
-	      "inode_link hook signature mismatch");
-
-/* try/dcache-whiteout: none of these hook structs is registered any more - the whiteout replaced
- * the whole LSM chain.  They are kept for one commit so the diff stays readable, and are removed
- * together with their handlers once the bypass lands.  The pragma is scoped to this block so a
- * real unused variable elsewhere still fails the build. */
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wunused-variable"
-
-static struct ksu_lsm_hook sus_path_unlink_hook =
-	KSU_LSM_HOOK_INSERT(inode_unlink, (void *)sus_path_inode_unlink);
-
-static struct ksu_lsm_hook sus_path_rmdir_hook =
-	KSU_LSM_HOOK_INSERT(inode_rmdir, (void *)sus_path_inode_rmdir);
-
-static struct ksu_lsm_hook sus_path_rename_hook =
-	KSU_LSM_HOOK_INSERT(inode_rename, (void *)sus_path_inode_rename);
-
-static struct ksu_lsm_hook sus_path_link_hook =
-	KSU_LSM_HOOK_INSERT(inode_link, (void *)sus_path_inode_link);
-
-/* ---- metadata and attribute operations ----
- *
- * These syscalls stop before any check we otherwise hook, so a hidden file could still be probed - in
- * the setattr case modified - while answering "permission denied" rather than "no such file".  Each has
- * an LSM hook carrying the dentry (or the path): sb_statfs for statfs/fstatfs; inode_setattr for
- * chmod/chown/truncate/utimes; inode_getxattr/_listxattr and inode_setxattr/_removexattr for the xattr
- * calls; path_notify for inotify_add_watch and fanotify_mark.  inode_setattr is the one that also
- * closes the error-code leak: without it an app got EPERM or EACCES from the owner check, which says
- * the file exists. */
-/* ---- the setxattr/removexattr FIRST argument, per kernel version ----
- *
- * These two are the only hooks here whose first parameter is not a dentry/inode/path: it is the
- * id-mapping the syscall came in through, and its type moved twice (upstream
- * include/linux/lsm_hook_defs.h): no first argument before v5.12; `struct user_namespace *mnt_userns`
- * from v5.12 (added with idmapped mounts), replaced by `struct mnt_idmap *idmap` in v6.3 ("fs: add
- * mnt_idmap").
- * The trees this module builds against agree: android12-5.10 declares no first argument,
- * android13-5.15/android14-6.1 declare mnt_userns, android15-6.6 declares idmap.  Three spellings are
- * needed because the macro has to work in a parameter list (with a name), in a function-pointer type
- * (no name) and as the leading call argument - and before 5.12 all three vanish.  The static_asserts
- * below make a wrong branch a build failure, never a silently mis-typed hook (a mismatched signature
- * is a kCFI panic at load time).
- *
- * inode_setattr, the other hook of this pair's family, got the id-mapping later than this gate's
- * v6.3: upstream v6.9 - and no release this module builds for shipped it before 6.12 (6.6 is
- * LTS-frozen and keeps the dentry/iattr pair) - which is why the setattr replacement has its own
- * gate below (SUS_SETATTR_MNT_ID_DECL/ARG, >= 6.12) rather than sharing this one: the version
- * boundary is not the same, and a hook declared with the wrong shape is a kCFI panic at load
- * time, not a warning. */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
-#define SUS_XATTR_MNT_ID_DECL	struct mnt_idmap *idmap,
-#define SUS_XATTR_MNT_ID_TYPE	struct mnt_idmap *,
-#define SUS_XATTR_MNT_ID_ARG	idmap,
-#elif LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
-#define SUS_XATTR_MNT_ID_DECL	struct user_namespace *mnt_userns,
-#define SUS_XATTR_MNT_ID_TYPE	struct user_namespace *,
-#define SUS_XATTR_MNT_ID_ARG	mnt_userns,
-#else	/* before idmapped mounts the hook never received an id mapping */
-#define SUS_XATTR_MNT_ID_DECL
-#define SUS_XATTR_MNT_ID_TYPE
-#define SUS_XATTR_MNT_ID_ARG
-#endif
-
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
-#define SUS_SETATTR_MNT_ID_DECL	struct mnt_idmap *idmap,
-#define SUS_SETATTR_MNT_ID_ARG	idmap,
-#else
-#define SUS_SETATTR_MNT_ID_DECL
-#define SUS_SETATTR_MNT_ID_ARG
-#endif
-
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
-/* A hook that TAKEN OVER SELinux's slot still has to run SELinux's decision, which it does by
- * calling the saved original through `hook.original` (SUS_LSM_PASS_ORIG below).  That call
- * goes through these trampolines instead of being made at the call site, and they are
- * __nocfi, because an INSTRUMENTED indirect call into the kernel panics here rather than
- * failing: the type id this module expects and the one the kernel emitted for its own
- * function do not agree.  Measured on a 5.15 device - the first call through a
- * kallsyms-resolved pointer died with
- *
- *     Kernel panic - not syncing: CFI failure (target: kallsyms_on_each_symbol+0x0/0x1e4)
- *
- * `noinline` is not decoration either.  LTO treats the attribute as a property of the
- * function it was written on, so it inlines an unchecked call back into a caller that lacks
- * it and the check reappears THERE - which is how that panic ended up in
- * susfs_sus_mount_supercall() instead of in the function that made the call.
- *
- * One trampoline per hook member, because each has to be called through its own prototype
- * (and the two idmap arguments are version-dependent, hence the DECL/ARG macros); the macro
- * only saves repeating the cast and the two attributes.  tools/cfi_sites.py asserts on the
- * built .ko that no other function in this module carries a checked call. */
-#define SUS_LSM_ORIG_CALL(member, ...)						\
-	static __nocfi noinline int sus_path_orig_##member(			\
-		LSM_HOOK_FN_TYPE(member) fn, __VA_ARGS__)
-
-SUS_LSM_ORIG_CALL(inode_getattr, const struct path *path)
-{
-	return fn(path);
-}
-
-SUS_LSM_ORIG_CALL(inode_permission, struct inode *inode, int mask)
-{
-	return fn(inode, mask);
-}
-
-SUS_LSM_ORIG_CALL(inode_unlink, struct inode *dir, struct dentry *dentry)
-{
-	return fn(dir, dentry);
-}
-
-SUS_LSM_ORIG_CALL(inode_rmdir, struct inode *dir, struct dentry *dentry)
-{
-	return fn(dir, dentry);
-}
-
-SUS_LSM_ORIG_CALL(inode_rename, struct inode *old_dir, struct dentry *old_dentry,
-		  struct inode *new_dir, struct dentry *new_dentry)
-{
-	return fn(old_dir, old_dentry, new_dir, new_dentry);
-}
-
-SUS_LSM_ORIG_CALL(inode_link, struct dentry *old_dentry, struct inode *dir,
-		  struct dentry *new_dentry)
-{
-	return fn(old_dentry, dir, new_dentry);
-}
-
-SUS_LSM_ORIG_CALL(sb_statfs, struct dentry *dentry)
-{
-	return fn(dentry);
-}
-
-SUS_LSM_ORIG_CALL(inode_setattr, SUS_SETATTR_MNT_ID_DECL
-		  struct dentry *dentry, struct iattr *attr)
-{
-	return fn(SUS_SETATTR_MNT_ID_ARG dentry, attr);
-}
-
-SUS_LSM_ORIG_CALL(inode_getxattr, struct dentry *dentry, const char *name)
-{
-	return fn(dentry, name);
-}
-
-SUS_LSM_ORIG_CALL(inode_listxattr, struct dentry *dentry)
-{
-	return fn(dentry);
-}
-
-SUS_LSM_ORIG_CALL(inode_setxattr, SUS_XATTR_MNT_ID_DECL
-		  struct dentry *dentry, const char *name, const void *value,
-		  size_t size, int flags)
-{
-	return fn(SUS_XATTR_MNT_ID_ARG dentry, name, value, size, flags);
-}
-
-SUS_LSM_ORIG_CALL(inode_removexattr, SUS_XATTR_MNT_ID_DECL
-		  struct dentry *dentry, const char *name)
-{
-	return fn(SUS_XATTR_MNT_ID_ARG dentry, name);
-}
-
-SUS_LSM_ORIG_CALL(path_notify, const struct path *path, u64 mask,
-		  unsigned int obj_type)
-{
-	return fn(path, mask, obj_type);
-}
-#endif	/* >= 6.12: the slot-takeover path is the only one that calls an original */
-
-static int sus_path_sb_statfs(struct dentry *dentry);
-static int sus_path_inode_setattr(SUS_SETATTR_MNT_ID_DECL
-				  struct dentry *dentry, struct iattr *attr);
-static int sus_path_inode_getxattr(struct dentry *dentry, const char *name);
-static int sus_path_inode_listxattr(struct dentry *dentry);
-static int sus_path_inode_setxattr(SUS_XATTR_MNT_ID_DECL
-				   struct dentry *dentry, const char *name,
-				   const void *value, size_t size, int flags);
-static int sus_path_inode_removexattr(SUS_XATTR_MNT_ID_DECL
-				      struct dentry *dentry, const char *name);
-static int sus_path_path_notify(const struct path *path, u64 mask,
-				unsigned int obj_type);
-
-static_assert(__builtin_types_compatible_p(LSM_HOOK_FN_TYPE(sb_statfs),
-					   typeof(&sus_path_sb_statfs)),
-	      "sb_statfs hook signature mismatch");
-static_assert(__builtin_types_compatible_p(LSM_HOOK_FN_TYPE(inode_setattr),
-					   typeof(&sus_path_inode_setattr)),
-	      "inode_setattr hook signature mismatch");
-static_assert(__builtin_types_compatible_p(LSM_HOOK_FN_TYPE(inode_getxattr),
-					   typeof(&sus_path_inode_getxattr)),
-	      "inode_getxattr hook signature mismatch");
-static_assert(__builtin_types_compatible_p(LSM_HOOK_FN_TYPE(inode_listxattr),
-					   typeof(&sus_path_inode_listxattr)),
-	      "inode_listxattr hook signature mismatch");
-static_assert(__builtin_types_compatible_p(LSM_HOOK_FN_TYPE(inode_setxattr),
-					   typeof(&sus_path_inode_setxattr)),
-	      "inode_setxattr hook signature mismatch");
-static_assert(__builtin_types_compatible_p(LSM_HOOK_FN_TYPE(inode_removexattr),
-					   typeof(&sus_path_inode_removexattr)),
-	      "inode_removexattr hook signature mismatch");
-static_assert(__builtin_types_compatible_p(LSM_HOOK_FN_TYPE(path_notify),
-					   typeof(&sus_path_path_notify)),
-	      "path_notify hook signature mismatch");
-
-static struct ksu_lsm_hook sus_path_statfs_hook =
-	KSU_LSM_HOOK_INSERT(sb_statfs, (void *)sus_path_sb_statfs);
-
-static struct ksu_lsm_hook sus_path_setattr_hook =
-	KSU_LSM_HOOK_INSERT(inode_setattr, (void *)sus_path_inode_setattr);
-
-static struct ksu_lsm_hook sus_path_getxattr_hook =
-	KSU_LSM_HOOK_INSERT(inode_getxattr, (void *)sus_path_inode_getxattr);
-
-static struct ksu_lsm_hook sus_path_listxattr_hook =
-	KSU_LSM_HOOK_INSERT(inode_listxattr, (void *)sus_path_inode_listxattr);
-
-static struct ksu_lsm_hook sus_path_setxattr_hook =
-	KSU_LSM_HOOK_INSERT(inode_setxattr, (void *)sus_path_inode_setxattr);
-
-static struct ksu_lsm_hook sus_path_removexattr_hook =
-	KSU_LSM_HOOK_INSERT(inode_removexattr, (void *)sus_path_inode_removexattr);
-
-static struct ksu_lsm_hook sus_path_notify_hook =
-	KSU_LSM_HOOK_INSERT(path_notify, (void *)sus_path_path_notify);
-
-static struct ksu_lsm_hook sus_path_getattr_hook =
-	KSU_LSM_HOOK_INSERT(inode_getattr, (void *)sus_path_inode_getattr);
-
-static struct ksu_lsm_hook sus_path_perm_hook =
-	KSU_LSM_HOOK_INSERT(inode_permission, (void *)sus_path_inode_permission);
-
-#pragma clang diagnostic pop
-
-static atomic_t n_enoent_getattr = ATOMIC_INIT(0);
-static atomic_t n_enoent_perm = ATOMIC_INIT(0);
-
-/* Store the registered path without a trailing slash, so "path/" and "path" both match
- * "path" and "path/child". */
-static void sus_path_entry_set_path(struct sus_path_entry *e, const char *path)
-{
-    size_t n = strnlen(path, SUS_PATH_LEN - 1);
-
-    while (n > 1 && path[n - 1] == '/')
-        n--;
-    memcpy(e->path, path, n);
-    e->path[n] = '\0';
-    e->path_len = (unsigned int)n;
-}
-
-/*
- * Inode identity is the whole criterion here: deliberately NO FUSE branch, so do not "port"
- * upstream's (susfs.c:71-84 in add, :151-166 in susfs_run_sus_path_loop(), :195-212 in
- * susfs_is_inode_sus_path()).  It is a no-op: get_fuse_inode() is container_of(inode, struct
- * fuse_inode, inode) (fs/fuse/fuse_i.h) over an inode embedded in that struct and upstream's `inode`
- * comes from d_backing_inode() (include/linux/dcache.h), so it flags fi->inode.i_mapping and
- * inode->i_mapping - the same word twice; only an i_mapping NULL check identical to the generic one
- * above it (susfs.c:65-69) and a log line remain.  Our ihold'ed `struct inode *` is just as
- * object-scoped and cannot be recycled, so FUSE and CONFIG_FUSE_BPF=y passthrough (this kernel's
- * gki_defconfig) need nothing special.
- * The dirent filter is where FUSE costs both implementations something: ilookup(buf->sb, d_ino)
- * upstream and our (d_ino, name) match both fail when a FUSE inode is hashed by nodeid while
- * inode->i_ino is the daemon's attr.ino and d_ino whatever the daemon replied (fs/fuse/inode.c) -
- * upstream then skips the entry unfiltered (patch:1752-1760).  A name-only fallback would hide
- * same-named entries elsewhere in the superblock, so none is added.
- */
-/* The key is IDENTITY, not the object: the inode pointer is only a cache in front of it.  A pointer
- * hit cannot be wrong, so it answers immediately; everything else is decided by (dev, i_ino), the
- * same key the mount layer uses for its identity records (s_dev + root inode number), and the
- * slow-path hit counter tells an operator whether the cache is doing its job and, when it is not,
- * that the rule's object is not the object readers get.
- * Why the object alone is not enough (both measured on hardware): after a quick rmmod + insmod a rule
- * can hold an inode no reader ever sees again while a NEW object carries the same (dev, i_ino) - seen
- * as ptr_equal=0 in sus_path_probe with this module's control nodes readable by uid 2000 again; and
- * ihold() keeps an inode alive but NOT hashed, so it can be unhashed while its number is handed out
- * again.  (dev, i_ino) is sound because a rule holds its inode from registration until del / clear /
- * unload: while that inode is the hashed one, its number cannot be reused.
- * One tier more, for this module's own control nodes only: another INSTANCE of the same filesystem
- * keeps the inode number but has its own s_dev (measured, a container's /proc: the same 4026535268
- * with dev 1048754 against the main /proc's 20), so their identity is (filesystem type, i_ino) -
- * procfs numbers come from a global allocator (proc_alloc_inum), so that pair can only be this
- * module's node while it is loaded.  Ordinary rules do not get that tier: across two mounts of one
- * type the same number can stand for two different files. */
-static atomic_t n_identity_hits = ATOMIC_INIT(0);
-
-static bool sus_path_inode_hidden(struct inode *inode)
-{
-    struct sus_path_entry *e;
-    bool hidden = false, by_identity = false;
-    u64 dev;
-
-    if (!inode || !READ_ONCE(sus_path_count))
-        return false;
-
-    /* See sus_path_resolver: the resolving task must not be answered by its own table,
-     * or its walk of that very path is refused. */
-    if (sus_path_is_resolver())
-        return false;
-
-    dev = (u64)inode->i_sb->s_dev;
-
-    spin_lock(&sus_path_lock);
-    list_for_each_entry(e, &sus_path_list, list) {
-        /* Fast path: the exact object the rule resolved. */
-        if (e->inode == inode) {
-            if (sus_path_entry_gate_inode(e, inode)) {
-                hidden = true;
-                break;
-            }
-            continue;
-        }
-        /* Pending rules have no identity yet (ino == 0) and are the LSM layer's blind
-         * spot by construction: nothing exists at their path to be accessed. */
-        if (!e->ino || e->ino != (u64)inode->i_ino)
-            continue;
-        if (e->dev == dev) {
-            by_identity = true;
-            if (sus_path_entry_gate_inode(e, inode)) {
-                hidden = true;
-                break;
-            }
-            continue;
-        }
-        /* Another instance of the same filesystem: control nodes only, see above. */
-        if (e->self_protect && e->inode &&
-            e->inode->i_sb->s_type == inode->i_sb->s_type) {
-            by_identity = true;
-            if (sus_path_entry_gate_inode(e, inode)) {
-                hidden = true;
-                break;
-            }
-        }
-    }
-    spin_unlock(&sus_path_lock);
-
-    if (by_identity)
-        atomic_inc(&n_identity_hits);
-
-    return hidden;
-}
-
 /* The same decision, published for the layers that hold the inode the kernel resolved instead
  * of a path they would have to resolve again (susfs_opath.c post-checks the file that an
  * open(..., O_PATH) produced).  The key has to be the inode and never a path string: the
@@ -1345,40 +979,6 @@ static bool sus_path_inode_hidden(struct inode *inode)
 bool sus_path_inode_hidden_public(struct inode *inode)
 {
     return sus_path_inode_hidden(inode);
-}
-
-static int sus_path_inode_getattr(const struct path *path)
-{
-    struct inode *inode;
-
-    if (path && path->dentry) {
-        inode = d_inode(path->dentry);
-        if (sus_path_inode_hidden(inode)) {
-            atomic_inc(&n_enoent_getattr);
-            return -ENOENT;
-        }
-    }
-    /* Not hidden: no opinion.  Below 6.12 the chain continues into SELinux, whose answer (and its
-     * AVC record) is what the caller gets; from 6.12 on SELinux's own slot for this member is the
-     * one this hook took over, so its decision is run here instead (SUS_LSM_PASS_ORIG) - same
-     * answer, same AVC record, just no longer by returning 0. */
-    SUS_LSM_PASS_ORIG(sus_path_getattr_hook, inode_getattr, path);
-    return 0;
-}
-
-static int sus_path_inode_permission(struct inode *inode, int mask)
-{
-    if (sus_path_inode_hidden(inode)) {
-        atomic_inc(&n_enoent_perm);
-        return -ENOENT;
-    }
-    /* Not hidden: 0, so SELinux still decides.  This matters most here: for an RCU walk
-     * SELinux answers -ECHILD and the ref-walk retry in inode_permission() depends on
-     * that answer reaching the caller unchanged - which from 6.12 makes the pass-through
-     * below mandatory rather than optional, because that answer is no longer produced by
-     * somebody else down the chain. */
-    SUS_LSM_PASS_ORIG(sus_path_perm_hook, inode_permission, inode, mask);
-    return 0;
 }
 
 /* Shared counter: the name-based ops answer one question, and the interesting fact is
@@ -1555,22 +1155,6 @@ static int sus_path_nameop_hit(void)
     return -ENOENT;
 }
 
-static int sus_path_inode_unlink(struct inode *dir, struct dentry *dentry)
-{
-    if (sus_path_dentry_hidden(dentry))
-        return sus_path_nameop_hit();
-    SUS_LSM_PASS_ORIG(sus_path_unlink_hook, inode_unlink, dir, dentry);
-    return 0;
-}
-
-static int sus_path_inode_rmdir(struct inode *dir, struct dentry *dentry)
-{
-    if (sus_path_dentry_hidden(dentry))
-        return sus_path_nameop_hit();
-    SUS_LSM_PASS_ORIG(sus_path_rmdir_hook, inode_rmdir, dir, dentry);
-    return 0;
-}
-
 static int sus_path_inode_rename(struct inode *old_dir, struct dentry *old_dentry,
 				 struct inode *new_dir, struct dentry *new_dentry)
 {
@@ -1580,17 +1164,6 @@ static int sus_path_inode_rename(struct inode *old_dir, struct dentry *old_dentr
         return sus_path_nameop_hit();
     SUS_LSM_PASS_ORIG(sus_path_rename_hook, inode_rename, old_dir, old_dentry,
                       new_dir, new_dentry);
-    return 0;
-}
-
-static int sus_path_inode_link(struct dentry *old_dentry, struct inode *dir,
-			       struct dentry *new_dentry)
-{
-    /* A hard link is a second name for the same inode: creating one while the file is
-     * hidden leaves the new name unhidden, so it is refused too. */
-    if (sus_path_dentry_hidden(old_dentry))
-        return sus_path_nameop_hit();
-    SUS_LSM_PASS_ORIG(sus_path_link_hook, inode_link, old_dentry, dir, new_dentry);
     return 0;
 }
 
@@ -1604,14 +1177,6 @@ static int sus_path_meta_hit(void)
     return -ENOENT;
 }
 
-static int sus_path_sb_statfs(struct dentry *dentry)
-{
-    if (sus_path_dentry_hidden(dentry))
-        return sus_path_meta_hit();
-    SUS_LSM_PASS_ORIG(sus_path_statfs_hook, sb_statfs, dentry);
-    return 0;
-}
-
 static int sus_path_inode_setattr(SUS_SETATTR_MNT_ID_DECL
 				  struct dentry *dentry, struct iattr *attr)
 {
@@ -1619,53 +1184,6 @@ static int sus_path_inode_setattr(SUS_SETATTR_MNT_ID_DECL
         return sus_path_meta_hit();
     SUS_LSM_PASS_ORIG(sus_path_setattr_hook, inode_setattr,
                       SUS_SETATTR_MNT_ID_ARG dentry, attr);
-    return 0;
-}
-
-static int sus_path_inode_getxattr(struct dentry *dentry, const char *name)
-{
-    if (sus_path_dentry_hidden(dentry))
-        return sus_path_meta_hit();
-    SUS_LSM_PASS_ORIG(sus_path_getxattr_hook, inode_getxattr, dentry, name);
-    return 0;
-}
-
-static int sus_path_inode_listxattr(struct dentry *dentry)
-{
-    if (sus_path_dentry_hidden(dentry))
-        return sus_path_meta_hit();
-    SUS_LSM_PASS_ORIG(sus_path_listxattr_hook, inode_listxattr, dentry);
-    return 0;
-}
-
-static int sus_path_inode_setxattr(SUS_XATTR_MNT_ID_DECL
-				   struct dentry *dentry, const char *name,
-				   const void *value, size_t size, int flags)
-{
-    if (sus_path_dentry_hidden(dentry))
-        return sus_path_meta_hit();
-    SUS_LSM_PASS_ORIG(sus_path_setxattr_hook, inode_setxattr,
-                      SUS_XATTR_MNT_ID_ARG dentry, name, value, size, flags);
-    return 0;
-}
-
-static int sus_path_inode_removexattr(SUS_XATTR_MNT_ID_DECL
-				      struct dentry *dentry, const char *name)
-{
-    if (sus_path_dentry_hidden(dentry))
-        return sus_path_meta_hit();
-    SUS_LSM_PASS_ORIG(sus_path_removexattr_hook, inode_removexattr,
-                      SUS_XATTR_MNT_ID_ARG dentry, name);
-    return 0;
-}
-
-static int sus_path_path_notify(const struct path *path, u64 mask, unsigned int obj_type)
-{
-    /* inotify_add_watch and fanotify_mark arrive here; their callers do not run an
-     * inode permission check on the target. */
-    if (path && sus_path_dentry_hidden(path->dentry))
-        return sus_path_meta_hit();
-    SUS_LSM_PASS_ORIG(sus_path_notify_hook, path_notify, path, mask, obj_type);
     return 0;
 }
 
