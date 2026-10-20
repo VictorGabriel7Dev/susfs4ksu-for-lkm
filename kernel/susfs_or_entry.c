@@ -273,37 +273,33 @@ static __nocfi noinline long or_sus_path_whiteout(const struct filename *name, i
 	struct file *f;
 	int res, fd;
 
-	pr_info("or_entry: whiteout enter path=%s dfd=%d flags=0x%lx\n", name->name, dfd, flags);
+	/* Zero cost while no rule exists: otherwise every open() on the system would pay the
+	 * kern_path() below for an empty table. */
+	if (!sus_path_whiteout_armed())
+		return SUSFS_OR_ENTRY_PASS;
+
 	res = or_parent_of(name, &parent, &last);
 	if (res) {
-		pr_info("or_entry: whiteout parent failed rc=%d\n", res);
 		return SUSFS_OR_ENTRY_PASS;
 	}
-	pr_info("or_entry: whiteout parent ok parent=%px last=%.*s\n",
-		parent.dentry, (int)last.len, last.name);
 	if (!sus_path_whiteout_lookup(parent.dentry, &last, name->name, &target)) {
-		pr_info("or_entry: whiteout no rule for %.*s\n", (int)last.len, last.name);
 		path_put(&parent);
 		return SUSFS_OR_ENTRY_PASS;
 	}
-	pr_info("or_entry: whiteout rule hit\n");
 	path_put(&parent);
 
 	if ((flags & (O_CREAT | O_EXCL)) == (O_CREAT | O_EXCL)) {
-		pr_info("or_entry: whiteout O_EXCL -> EEXIST\n");
 		path_put(&target);
 		return -EEXIST;
 	}
 	fd = or_get_unused_fd_flags_fn((unsigned)(flags & O_CLOEXEC));
 	if (fd < 0) {
-		pr_info("or_entry: whiteout no fd rc=%d\n", fd);
 		path_put(&target);
 		return fd;
 	}
 	f = dentry_open(&target, (int)((flags & ~O_CLOEXEC) | O_LARGEFILE), current_cred());
 	path_put(&target);
 	if (IS_ERR(f)) {
-		pr_info("or_entry: whiteout dentry_open failed rc=%ld\n", PTR_ERR(f));
 		or_put_unused_fd_fn((unsigned)fd);
 		return PTR_ERR(f);
 	}
@@ -314,13 +310,11 @@ static __nocfi noinline long or_sus_path_whiteout(const struct filename *name, i
 		res = vfs_truncate(&tp, 0);
 		path_put(&tp);
 		if (res) {
-			pr_info("or_entry: whiteout truncate failed rc=%d\n", res);
 			fput(f);
 			or_put_unused_fd_fn((unsigned)fd);
 			return res;
 		}
 	}
-	pr_info("or_entry: whiteout ok fd=%d\n", fd);
 	or_fd_install_fn((unsigned)fd, f);
 	return fd;
 }
@@ -369,7 +363,6 @@ static __nocfi noinline long or_newfstatat(const struct pt_regs *regs)
 
 static __nocfi noinline long or_entry_redirect(const struct pt_regs *regs, int kind)
 {
-	pr_info("or_entry: redirect enter kind=%d\n", kind);
 	const char __user *uname = NULL;
 	unsigned long flags = 0, mode = 0, resolve = 0, usize = 0, o2flags = 0;
 	/* The descriptor's own flag, kept out of the narrowing the file flags go through: the kernel

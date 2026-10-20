@@ -207,6 +207,14 @@ static void sus_path_whiteout_remove(struct sus_path_entry *e)
  * and it says ENOENT because the whiteout is in the dcache.  Only the callers the rule is
  * visible to get a path back.  The path is reference-counted under the lock, so it stays valid
  * after unlocking. */
+/* Whether any rule has a whiteout installed.  The open bypass asks this before touching a
+ * path at all: without it every open() on the system would pay a kern_path() of the parent
+ * for a table that is empty. */
+bool sus_path_whiteout_armed(void)
+{
+    return READ_ONCE(sus_path_count) > 0;
+}
+
 bool sus_path_whiteout_lookup(struct dentry *parent, const struct qstr *name,
                               const char *full_path, struct path *out)
 {
@@ -214,8 +222,6 @@ bool sus_path_whiteout_lookup(struct dentry *parent, const struct qstr *name,
     bool found = false;
 
     if (!READ_ONCE(sus_path_count) || !name) {
-        pr_info("sus_path: whiteout lookup skipped count=%u name=%d\n",
-                READ_ONCE(sus_path_count), !!name);
         return false;
     }
     spin_lock(&sus_path_lock);
@@ -223,7 +229,6 @@ bool sus_path_whiteout_lookup(struct dentry *parent, const struct qstr *name,
         bool name_ok, path_ok;
 
         if (!e->whiteout || !e->whiteout_src.dentry) {
-            pr_info("sus_path: whiteout rule %s has no whiteout installed\n", e->path);
             continue;
         }
         /* Two ways to the same answer, and the path string is the one that survives
@@ -241,8 +246,6 @@ bool sus_path_whiteout_lookup(struct dentry *parent, const struct qstr *name,
         if (!path_ok && !(parent && e->whiteout_src.dentry->d_parent == parent && name_ok))
             continue;
         if (sus_path_entry_gate_inode(e, e->inode)) {	/* hidden from this caller */
-            pr_info("sus_path: whiteout gate hides %.*s (self_protect=%d)\n",
-                    (int)name->len, name->name, (int)e->self_protect);
             continue;
         }
         *out = e->whiteout_src;

@@ -177,6 +177,7 @@ bool sus_path_inode_hidden_public(struct inode *inode);
 /* try/dcache-whiteout: the open bypass resolves the name to (parent, last) and asks this.
  * Returns true with a reference taken in *out when a rule hides that name; the caller owns
  * it and must path_put(). */
+bool sus_path_whiteout_armed(void);
 bool sus_path_whiteout_lookup(struct dentry *parent, const struct qstr *name,
                               const char *full_path, struct path *out);
 
