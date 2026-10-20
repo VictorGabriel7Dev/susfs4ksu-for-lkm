@@ -591,6 +591,8 @@ static int sus_path_resolve_pending(void)
     unsigned int gen;
     int budget = SUS_PATH_PENDING_BUDGET;
     int resolved = 0;
+    int updated = 0;    /* loop rules whose inode changed under them */
+    int dropped = 0;    /* loop rules that went back to pending */
 
     if (READ_ONCE(sus_path_stopping) || !atomic_read(&sus_path_n_pending))
         return 0;
@@ -617,6 +619,7 @@ static int sus_path_resolve_pending(void)
         const struct cred *borrowed = NULL;
         struct path p;
         char name[NAME_MAX + 1];
+        struct inode *old = NULL;   /* the inode this pass replaces, iput() after the unlock */
         bool published = false;
         bool have_path = false;
         int rc;
@@ -625,7 +628,7 @@ static int sus_path_resolve_pending(void)
         spin_lock(&sus_path_lock);
         slot = NULL;
         list_for_each_entry(e, &sus_path_list, list) {
-            if (!e->inode && e->pass != gen) {
+            if ((!e->inode || e->loop) && e->pass != gen) {
                 memcpy(path, e->path, e->path_len + 1);
                 e->pass = gen;
                 slot = e;
@@ -685,7 +688,26 @@ static int sus_path_resolve_pending(void)
                 atomic_set(&sus_path_pend_last_rc, rc);
             spin_lock(&sus_path_lock);
         }
-        if (slot && inode && !rc) {
+        if (slot && inode && !rc && slot->inode &&
+            (slot->inode->i_sb != inode->i_sb || slot->inode->i_ino != inode->i_ino)) {
+            /* The path now names a different inode: the file was replaced.  Restore the old
+             * inode's i_op BEFORE dropping our pointer to it, swap, then treat the new inode
+             * like a fresh resolution (relax + arm) so both faces move together.  `old` keeps
+             * the reference released after the unlock, because iput() may sleep. */
+            sus_path_iop_restore(slot);
+            old = slot->inode;
+            slot->inode = inode;
+            inode = NULL;
+            slot->sb = slot->inode->i_sb;
+            slot->dev = (u64)slot->inode->i_sb->s_dev;
+            slot->ino = (u64)slot->inode->i_ino;
+            strscpy(slot->name, name, sizeof(slot->name));
+            sus_path_relax_mode(slot);
+            if (sus_path_iop_arm(slot))
+                atomic_inc(&n_iop_arm_fail);
+            updated++;
+            published = true;
+        } else if (slot && inode && !rc) {
             slot->sb = inode->i_sb;
             slot->dev = (u64)inode->i_sb->s_dev;
             slot->ino = (u64)inode->i_ino;
@@ -708,9 +730,23 @@ static int sus_path_resolve_pending(void)
             if (sus_path_iop_arm(slot))
                 atomic_inc(&n_iop_arm_fail);
         }
+        /* A loop rule whose path no longer resolves goes back to pending: the retry timer
+         * picks it up when the path reappears, and until then the rule hides nothing (which
+         * is the right answer - the name does not exist). */
+        if (slot && !inode && !rc && slot->inode) {
+            sus_path_iop_restore(slot);
+            old = slot->inode;
+            slot->inode = NULL;
+            atomic_inc(&sus_path_n_pending);
+            dropped++;
+        }
         spin_unlock(&sus_path_lock);
         mutex_unlock(&sus_path_lifecycle_lock);
 
+        if (old) {
+            iput(old);                  /* the inode the rule used to follow */
+            old = NULL;
+        }
         if (inode) {
             iput(inode);                /* the rule is gone, or already resolved */
         } else if (!published && !rc) {
@@ -720,9 +756,10 @@ static int sus_path_resolve_pending(void)
             path_put(&p);
     }
 
-    if (resolved)
-        SUSFS_LOGI("sus_path: resolved %d pending rule(s), %d still unresolved\n",
-                resolved, atomic_read(&sus_path_n_pending));
+    if (resolved || updated || dropped)
+        SUSFS_LOGI("sus_path: resolved %d pending, updated %d loop rule(s), "
+                "dropped %d back to pending, %d still unresolved\n",
+                resolved, updated, dropped, atomic_read(&sus_path_n_pending));
 
     mutex_unlock(&sus_path_pending_lock);
 
@@ -738,13 +775,16 @@ static int sus_path_resolve_pending(void)
  * context. */
 static void sus_path_pending_arm(void)
 {
-    if (READ_ONCE(sus_path_stopping) || !atomic_read(&sus_path_n_pending))
+    if (READ_ONCE(sus_path_stopping) ||
+        (!atomic_read(&sus_path_n_pending) && !atomic_read(&sus_path_n_loop)))
         return;
 
     sus_path_resolve_pending();
     spin_lock(&sus_path_lock);
-    if (!sus_path_stopping && atomic_read(&sus_path_n_pending)) {
-        atomic_set(&sus_path_pending_tries, 0);
+    if (!sus_path_stopping && (atomic_read(&sus_path_n_pending) ||
+                               atomic_read(&sus_path_n_loop))) {
+        if (atomic_read(&sus_path_n_pending))
+            atomic_set(&sus_path_pending_tries, 0);
         schedule_delayed_work(&sus_path_pending_wq, SUS_PATH_PENDING_RETRY_S * HZ);
     }
     spin_unlock(&sus_path_lock);
@@ -765,20 +805,27 @@ static void sus_path_pending_work(struct work_struct *w)
     atomic_inc(&sus_path_pend_ticks);
     resolved = sus_path_resolve_pending();
 
-    if (!atomic_read(&sus_path_n_pending))
-        return;                 /* every rule has its inode now */
+    if (!atomic_read(&sus_path_n_pending) && !atomic_read(&sus_path_n_loop))
+        return;                 /* nothing left to resolve or follow */
 
     if (resolved > 0)
         atomic_set(&sus_path_pending_tries, 0);     /* progress: keep trying */
 
-    if (atomic_inc_return(&sus_path_pending_tries) > SUS_PATH_PENDING_TRIES) {
+    /* The give-up bound covers rules that were never resolved, not loop rules: a loop rule
+     * with an inode has to keep being followed for as long as it exists, or replacing the file
+     * would silently stop hiding it.  A rule that never resolves still stops the timer (its
+     * answer cannot change without an add), and the next add re-arms it. */
+    if (atomic_read(&sus_path_n_loop)) {
+        atomic_set(&sus_path_pending_tries, 0);     /* loop rules never give up */
+    } else if (atomic_inc_return(&sus_path_pending_tries) > SUS_PATH_PENDING_TRIES) {
         SUSFS_LOGI("sus_path: %d rule(s) still pending after %d retries (last walk rc=%d) - retry timer stops; they hide nothing until they resolve, the next add tries again\n",
                 atomic_read(&sus_path_n_pending), SUS_PATH_PENDING_TRIES,
                 atomic_read(&sus_path_pend_last_rc));
         return;
     }
     spin_lock(&sus_path_lock);
-    if (!sus_path_stopping && atomic_read(&sus_path_n_pending))
+    if (!sus_path_stopping && (atomic_read(&sus_path_n_pending) ||
+                               atomic_read(&sus_path_n_loop)))
         schedule_delayed_work(&sus_path_pending_wq, SUS_PATH_PENDING_RETRY_S * HZ);
     spin_unlock(&sus_path_lock);
 }
