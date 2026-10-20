@@ -148,6 +148,12 @@ static int (*or_filename_parentat_fn)(int dfd, struct filename *name, unsigned i
 /* Fills struct stat from a kstat.  Resolved by name instead of reimplemented, so the
  * translation cannot drift from the kernel's own. */
 static void (*or_cp_new_stat_fn)(struct kstat *stat, struct stat __user *statbuf);
+/* statx fills a different structure; readlinkat needs the link body.  Both resolved by name
+ * for the same reason CP_NEW_STAT is. */
+static void (*or_cp_statx_fn)(const struct kstat *stat, void __user *buffer);
+static int (*or_vfs_readlink_fn)(struct dentry *dentry, char __user *buffer, int buflen);
+static struct susfs_fp_hook or_statx_hook;
+static struct susfs_fp_hook or_readlinkat_hook;
 /* The stat-side table entry (try/dcache-whiteout).  Defined next to its wrapper below. */
 static struct susfs_fp_hook or_newfstatat_hook;
 static void (*or_putname_fn)(struct filename *name);
@@ -359,6 +365,86 @@ static __nocfi noinline long or_newfstatat(const struct pt_regs *regs)
 		return res;
 	or_cp_new_stat_fn(&st, statbuf);
 	return 0;
+}
+
+/* ---- sus_path whiteout: statx ----
+ *
+ * Same shape as newfstatat: the saved path answers, and the kernel's own cp_statx fills the
+ * user structure, so the kstat -> statx translation cannot drift.
+ */
+static __nocfi noinline long or_statx(const struct pt_regs *regs)
+{
+	const char __user *uname = (const char __user *)regs->regs[1];
+	unsigned int sflags = (unsigned int)regs->regs[2];
+	unsigned int mask = (unsigned int)regs->regs[3];
+	void __user *statxbuf = (void __user *)regs->regs[4];
+	struct path parent, target;
+	struct filename *name;
+	struct qstr last;
+	struct kstat st;
+	int res;
+
+	if (!or_cp_statx_fn || !sus_path_whiteout_armed())
+		return or_statx_hook.orig(regs);
+	name = or_getname_flags_fn(uname, 0, NULL);
+	if (IS_ERR(name))
+		return or_statx_hook.orig(regs);
+	res = or_parent_of(name, &parent, &last);
+	if (res) {
+		or_putname_fn(name);
+		return or_statx_hook.orig(regs);
+	}
+	if (!sus_path_whiteout_lookup(parent.dentry, &last, name->name, &target)) {
+		path_put(&parent);
+		or_putname_fn(name);
+		return or_statx_hook.orig(regs);
+	}
+	path_put(&parent);
+	memset(&st, 0, sizeof(st));
+	res = vfs_getattr(&target, &st, mask, sflags);
+	path_put(&target);
+	or_putname_fn(name);
+	if (res)
+		return res;
+	or_cp_statx_fn(&st, statxbuf);   /* cp_statx takes the mask from st.result_mask */
+	return 0;
+}
+
+/* ---- sus_path whiteout: readlinkat ----
+ *
+ * The link body comes from the saved dentry, so the negative dentry never has to answer - and
+ * a hidden file's readlink does not become an "is it a link?" oracle.
+ */
+static __nocfi noinline long or_readlinkat(const struct pt_regs *regs)
+{
+	const char __user *uname = (const char __user *)regs->regs[1];
+	char __user *buf = (char __user *)regs->regs[2];
+	int buflen = (int)regs->regs[3];
+	struct path parent, target;
+	struct filename *name;
+	struct qstr last;
+	int res;
+
+	if (!or_vfs_readlink_fn || !sus_path_whiteout_armed())
+		return or_readlinkat_hook.orig(regs);
+	name = or_getname_flags_fn(uname, 0, NULL);
+	if (IS_ERR(name))
+		return or_readlinkat_hook.orig(regs);
+	res = or_parent_of(name, &parent, &last);
+	if (res) {
+		or_putname_fn(name);
+		return or_readlinkat_hook.orig(regs);
+	}
+	if (!sus_path_whiteout_lookup(parent.dentry, &last, name->name, &target)) {
+		path_put(&parent);
+		or_putname_fn(name);
+		return or_readlinkat_hook.orig(regs);
+	}
+	path_put(&parent);
+	res = or_vfs_readlink_fn(target.dentry, buf, buflen);
+	path_put(&target);
+	or_putname_fn(name);
+	return res;
 }
 
 static __nocfi noinline long or_entry_redirect(const struct pt_regs *regs, int kind)
@@ -698,6 +784,24 @@ int susfs_or_entry_init(void)
 		or_newfstatat_hook.wrapper = or_newfstatat;
 		if (susfs_fp_install(&or_newfstatat_hook))
 			SUSFS_LOGI("or_entry: newfstatat bypass not installed - a hidden stat stays ENOENT\n");
+	}
+	/* try/dcache-whiteout: statx and readlinkat, same shape.  Optional at run time: a kernel
+	 * without cp_statx or vfs_readlink keeps the old behaviour for that syscall. */
+	or_cp_statx_fn = (void *)find_kernel_symbol_exact("cp_statx");
+	if (or_cp_statx_fn) {
+		or_statx_hook.nr = __NR_statx;
+		or_statx_hook.name = "statx";
+		or_statx_hook.wrapper = or_statx;
+		if (susfs_fp_install(&or_statx_hook))
+			SUSFS_LOGI("or_entry: statx bypass not installed - a hidden statx stays ENOENT\n");
+	}
+	or_vfs_readlink_fn = (void *)find_kernel_symbol_exact("vfs_readlink");
+	if (or_vfs_readlink_fn) {
+		or_readlinkat_hook.nr = __NR_readlinkat;
+		or_readlinkat_hook.name = "readlinkat";
+		or_readlinkat_hook.wrapper = or_readlinkat;
+		if (susfs_fp_install(&or_readlinkat_hook))
+			SUSFS_LOGI("or_entry: readlinkat bypass not installed - a hidden readlink stays ENOENT\n");
 	} else {
 		SUSFS_LOGI("or_entry: cp_new_stat not found - the newfstatat bypass is off\n");
 	}
@@ -716,4 +820,6 @@ void susfs_or_entry_exit(void)
 	or_entry_ready = false;
 	/* try/dcache-whiteout: put the stat entry back before this module's text goes away. */
 	susfs_fp_remove(&or_newfstatat_hook);
+	susfs_fp_remove(&or_statx_hook);
+	susfs_fp_remove(&or_readlinkat_hook);
 }
