@@ -287,7 +287,18 @@ static void sus_path_restore_mode(struct sus_path_entry *e)
     e->orig_mode = 0;
 }
 
-static void sus_path_entry_set_path(struct sus_path_entry *e, const char *path);
+/* Store the registered path without a trailing slash, so "path/" and "path" both match
+ * "path" and "path/child". */
+static void sus_path_entry_set_path(struct sus_path_entry *e, const char *path)
+{
+    size_t n = strnlen(path, SUS_PATH_LEN - 1);
+
+    while (n > 1 && path[n - 1] == '/')
+        n--;
+    memcpy(e->path, path, n);
+    e->path[n] = '\0';
+    e->path_len = (unsigned int)n;
+}
 
 static LIST_HEAD(sus_path_list);
 static LIST_HEAD(sus_path_retiring);
