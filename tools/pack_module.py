@@ -93,8 +93,7 @@ def main():
         for name in ("post-fs-data.sh", "customize.sh", "kmi.sh", "early-dispatch.sh", "load.sh", "uninstall.sh"):
             z.write(ROOT / "module" / name, name)
         z.writestr("kmis", "".join(k + "\n" for k in kmis))
-        if args.kmi_override:
-            z.writestr("kmi_override", args.kmi_override + "\n")
+        z.writestr("kmi_override", args.kmi_override + "\n" if args.kmi_override else "")
         z.writestr("module.prop", module_prop)
         z.write(insmod, "bin/susfs_insmod")
         for p in kos:

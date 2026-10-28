@@ -3,14 +3,19 @@
 # Pick the packaged KMI for a kernel release string. The packaged set lives in
 # "$2/kmis" (one <android-os>-<kver> per line), so adding a KMI needs no edit here.
 
-# An operator can force one packaged KMI by putting a single line in
-# "$1/kmi_override".  It is accepted only when that line is one of the packaged
-# KMIs and its .ko is present; anything else (missing, blank, malformed, stale)
-# deliberately returns failure so callers fall back to select_kmi().
-select_kmi_override() {
+# The packaged file is deliberately empty by default: an empty override means
+# "use automatic detection", not "invalid".  Non-empty content is accepted only
+# when it is one of the packaged KMIs and its .ko is present.
+kmi_override_value() {
   file="$1/kmi_override"
-  [ -f "$file" ] || return 1
-  kmi=$(head -n 1 "$file" 2>/dev/null | tr -d '\r' | tr -d '[:space:]')
+  [ -f "$file" ] || return 0
+  head -n 1 "$file" 2>/dev/null | tr -d '\r' | tr -d '[:space:]'
+}
+
+# Print the forced KMI, or fail so callers fall back to select_kmi().  An empty
+# override is a normal fallback, not an error.
+select_kmi_override() {
+  kmi=$(kmi_override_value "$1")
   [ -n "$kmi" ] || return 1
   while IFS= read -r known; do
     [ "$known" = "$kmi" ] || continue

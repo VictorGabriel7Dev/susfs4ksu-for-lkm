@@ -26,14 +26,14 @@ def main():
                         "--ddk-images", str(ddk_images), "--out", str(out)], check=True)
         with zipfile.ZipFile(out) as z:
             names = set(z.namelist())
-            need = {"post-fs-data.sh", "customize.sh", "kmi.sh", "early-dispatch.sh", "load.sh", "uninstall.sh", "kmis", "module.prop",
+            need = {"post-fs-data.sh", "customize.sh", "kmi.sh", "early-dispatch.sh", "load.sh", "uninstall.sh", "kmis", "kmi_override", "module.prop",
                     "bin/susfs_insmod", "provenance.json", "LICENSE"} | {f"lib/susfs_guard_lkm-{k}.ko" for k in kmis}
             assert not need - names, f"missing: {need - names}"
             prop = z.read("module.prop").decode()
             assert "id=susfs_guard_lkm" in prop and "version=v0.0.0-test" in prop, prop
             assert z.read("kmis").decode().split() == kmis
             assert "early_load" not in names
-            assert "kmi_override" not in names
+            assert z.read("kmi_override") == b""
             provenance = z.read("provenance.json").decode()
             for needle in ('"github_sha": "' + "1" * 40 + '"',
                            '"github_run_id": 12345',

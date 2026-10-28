@@ -32,7 +32,7 @@ rmmod susfs_guard_lkm
 
 To skip picking the `.ko` by hand, each release also ships a packaged module `susfs_guard_lkm-module-<tag>-arm64.zip`: flash it in a KernelSU manager and reboot. The module picks the `.ko` for the device kernel (`/proc/sys/kernel/osrelease`), loads it with `expose_proc=1`, applies no susfs rules, and skips if susfs is already present. arm64 and KernelSU-compatible managers only. `expose_proc=1` creates the `/proc/susfs_*` control nodes; sus rules are applied through them. To remove it: disable or remove the module in the KSU manager (takes effect after a reboot), or `rmmod susfs_guard_lkm` to unload it live.
 
-When automatic detection fails, or to force one variant, add a `kmi_override` file to the module ZIP (or the installed module directory) containing one line from `kmis`, for example `android17-6.18`. It is used first when the matching `lib/susfs_guard_lkm-<KMI>.ko` is present; otherwise the loader falls back to automatic detection. The installer only copies the loader and never reads or selects a KMI; selection and the override happen in the boot loader, whose module status distinguishes `✅ custom load`, `✅ auto-detected`, and `❌ KMI detection failed`.
+To choose a KMI manually, edit the module's `kmi_override` and set it to the desired KMI. The module ships this file empty by default; an empty value means automatic detection. The installer only copies the loader and never reads or selects a KMI; selection and the override happen in the boot loader, whose module status distinguishes `✅ custom load`, `✅ auto-detected`, and `❌ KMI detection failed`.
 
 Loading normally runs in the module's `post-fs-data` stage. To opt into loading from the earlier common `post-fs-data.d` stage, run as root:
 

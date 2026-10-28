@@ -29,16 +29,24 @@ fi
 REL=$(cat /proc/sys/kernel/osrelease 2>/dev/null) || REL=""
 [ -n "$REL" ] || REL="unknown"
 . "$MODDIR/kmi.sh"
-# A packaged override wins over the release string, but only when it names a
-# KMI whose .ko is actually in this module; anything else falls back to the
-# automatic path below.
-KMI=$(select_kmi_override "$MODDIR")
-if [ -n "$KMI" ]; then
-  MODE=custom
-  echo "kmi_override: $KMI (kernel $REL)"
+# A non-empty packaged override wins over the release string, but only when it
+# names a KMI whose .ko is actually in this module.  The packaged file starts
+# empty, and an empty value is the normal "automatic" path - not an error.
+OVERRIDE=$(kmi_override_value "$MODDIR")
+KMI=""
+if [ -n "$OVERRIDE" ]; then
+  KMI=$(select_kmi_override "$MODDIR")
+  if [ -n "$KMI" ]; then
+    MODE=custom
+    echo "kmi_override: $KMI (kernel $REL)"
+  else
+    MODE=auto
+    echo "kmi_override '$OVERRIDE' is not packaged; using automatic KMI detection"
+  fi
 else
   MODE=auto
-  [ ! -f "$MODDIR/kmi_override" ] || echo "kmi_override invalid; using automatic KMI detection"
+fi
+if [ "$MODE" = auto ]; then
   [ "$REL" != unknown ] || {
     echo "KMI detection failed: cannot read kernel release"
     set_description "❌ KMI detection failed: cannot read kernel release"
