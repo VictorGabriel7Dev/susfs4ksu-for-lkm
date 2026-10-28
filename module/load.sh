@@ -34,34 +34,40 @@ REL=$(cat /proc/sys/kernel/osrelease 2>/dev/null) || REL=""
 # automatic path below.
 KMI=$(select_kmi_override "$MODDIR")
 if [ -n "$KMI" ]; then
+  MODE=custom
   echo "kmi_override: $KMI (kernel $REL)"
 else
+  MODE=auto
   [ ! -f "$MODDIR/kmi_override" ] || echo "kmi_override invalid; using automatic KMI detection"
   [ "$REL" != unknown ] || {
-    echo "cannot read kernel release"
-    set_description "failed: cannot read kernel release"
+    echo "KMI detection failed: cannot read kernel release"
+    set_description "❌ KMI detection failed: cannot read kernel release"
     exit 1
   }
   KMI=$(select_kmi "$REL" "$MODDIR") || {
-    echo "no packaged .ko for kernel: $REL"
-    set_description "failed: no packaged .ko for kernel $REL"
+    echo "KMI detection failed: no packaged .ko for kernel: $REL"
+    set_description "❌ KMI detection failed: no packaged .ko for kernel $REL"
     exit 1
   }
 fi
 KO="$MODDIR/lib/susfs_guard_lkm-$KMI.ko"
 [ -s "$KO" ] || {
-  echo "missing .ko for $KMI"
-  set_description "failed: missing .ko for $KMI"
+  echo "KMI detection failed: missing .ko for $KMI"
+  set_description "❌ KMI detection failed: missing .ko for $KMI"
   exit 1
 }
-echo "kernel $REL -> $KMI"
+echo "kernel $REL -> $KMI ($MODE)"
 "$MODDIR/bin/susfs_insmod" "$KO" expose_proc=1
 rc=$?
 if [ "$rc" = 0 ]; then
-  echo "loaded."
-  set_description "✅ loaded ($KMI) | kernel $REL"
+  echo "loaded ($MODE)."
+  if [ "$MODE" = custom ]; then
+    set_description "✅ custom load ($KMI) | kernel $REL"
+  else
+    set_description "✅ auto-detected ($KMI) | kernel $REL"
+  fi
 else
   echo "susfs_insmod failed: $rc"
-  set_description "❌ load failed ($KMI): susfs_insmod rc=$rc | kernel $REL"
+  set_description "❌ load failed [$MODE] ($KMI): susfs_insmod rc=$rc | kernel $REL"
 fi
 exit "$rc"

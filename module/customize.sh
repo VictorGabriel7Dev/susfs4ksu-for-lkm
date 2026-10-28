@@ -1,18 +1,11 @@
 #!/system/bin/sh
 # SPDX-License-Identifier: GPL-2.0-only
+# Installation only: copy and wire the loader.  The KMI is deliberately not
+# inspected or selected here - load.sh owns detection and the override, so an
+# install can succeed even when the recovery/installer environment cannot read
+# the target kernel's release string.
 [ "$KSU" = true ] || abort "- KernelSU-compatible manager required."
 [ "$ARCH" = arm64 ] || abort "- arm64 only."
-REL=$(cat /proc/sys/kernel/osrelease 2>/dev/null) || REL=""
-. "$MODPATH/kmi.sh"
-KMI=$(select_kmi_override "$MODPATH")
-if [ -n "$KMI" ]; then
-  ui_print "- using packaged kmi_override: $KMI"
-else
-  [ ! -f "$MODPATH/kmi_override" ] || ui_print "- kmi_override invalid; using automatic KMI detection"
-  [ -n "$REL" ] || abort "- cannot read kernel release and no valid kmi_override."
-  KMI=$(select_kmi "$REL" "$MODPATH") || abort "- no packaged .ko for this kernel: $REL"
-fi
-[ -s "$MODPATH/lib/susfs_guard_lkm-$KMI.ko" ] || abort "- missing .ko for $KMI."
 INSTALLED=/data/adb/modules/susfs_guard_lkm
 HOOK=/data/adb/post-fs-data.d/00-susfs-guard-lkm.sh
 if { [ -e "$HOOK" ] || [ -L "$HOOK" ]; } && ! cmp -s "$HOOK" "$MODPATH/early-dispatch.sh"; then
@@ -29,7 +22,8 @@ mkdir -p /data/adb/post-fs-data.d || abort "- cannot create common script direct
 cp "$MODPATH/early-dispatch.sh" "$HOOK.tmp" || abort "- cannot stage early dispatcher."
 chmod 0755 "$HOOK.tmp" || abort "- cannot set dispatcher permissions."
 mv -f "$HOOK.tmp" "$HOOK" || abort "- cannot install early dispatcher."
-ui_print "- susfs_guard_lkm for $KMI (arm64)"
+ui_print "- susfs_guard_lkm (arm64)"
+ui_print "- KMI is selected by the boot loader, not by this installer"
 ui_print "- Loader only; no rules are applied"
 ui_print "- Reboot to load; will not stack on an already-present susfs"
 ui_print "- Optional early loading: create $INSTALLED/early_load, then reboot."

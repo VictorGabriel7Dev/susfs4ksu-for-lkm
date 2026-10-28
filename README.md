@@ -32,7 +32,7 @@ rmmod susfs_guard_lkm
 
 想免去手动选 `.ko`，每个 release 还附带打包好的模块 `susfs_guard_lkm-module-<tag>-arm64.zip`：在 KernelSU 管理器里刷入、重启即可。模块会按设备内核（`/proc/sys/kernel/osrelease`）自动选择并加载对应的 `.ko`（带 `expose_proc=1`），只负责加载、不设任何 susfs 规则；若系统已存在 susfs 则跳过。仅 arm64、仅 KernelSU 系管理器。`expose_proc=1` 会建立 `/proc/susfs_*` 控制节点，sus 规则通过这些节点下发。要移除：在管理器里停用或删除本模块（重启后生效），或 `rmmod susfs_guard_lkm` 当场卸载。
 
-自动识别失败或想强制指定时，在模块 ZIP 内（安装后为模块目录）加入 `kmi_override`，内容为 `kmis` 中的一行，例如 `android17-6.18`。文件存在且对应 `lib/susfs_guard_lkm-<KMI>.ko` 有效时优先使用，否则回退自动识别。
+自动识别失败或想强制指定时，在模块 ZIP 内（安装后为模块目录）加入 `kmi_override`，内容为 `kmis` 中的一行，例如 `android17-6.18`。文件存在且对应 `lib/susfs_guard_lkm-<KMI>.ko` 有效时优先使用，否则回退自动识别。安装器只负责复制加载器，不读取或选择 KMI；识别和 override 都由启动时的加载器完成，模块状态会区分 `✅ custom load`、`✅ auto-detected` 和 `❌ KMI detection failed`。
 
 默认在模块的 `post-fs-data` 阶段加载。若需提前到公共 `post-fs-data.d` 阶段，以 root 执行：
 
