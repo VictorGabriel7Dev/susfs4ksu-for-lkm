@@ -10,6 +10,7 @@ on:
       - legacy
     paths-ignore:
       - "**.md"
+      - "**.yaml"
   # Pull requests build the same way, which is what a fork contribution needs: the first fork PR this
   # repository took arrived with a header comment that broke every variant, and nothing here could
   # see it until the branch had been pulled in by hand.  This is safe to enable because GitHub runs the
@@ -22,6 +23,7 @@ on:
       - dev
     paths-ignore:
       - "**.md"
+      - "**.yaml"
   workflow_dispatch:
 
 # Least privilege for GITHUB_TOKEN: this workflow only checks the repository out, and its own artifact

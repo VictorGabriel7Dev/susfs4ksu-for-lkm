@@ -21,6 +21,7 @@ on:
     branches: [main, dev]
     paths-ignore:
       - "**.md"
+      - "**.yaml"
   schedule:
     - cron: '17 3 * * 1'
   workflow_dispatch:
