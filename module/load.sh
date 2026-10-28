@@ -26,17 +26,28 @@ if [ -e /proc/susfs_path ] || [ -d /sys/module/susfs_guard_lkm ]; then
   set_description "already present (built-in or loaded earlier)"
   exit 0
 fi
-REL=$(cat /proc/sys/kernel/osrelease) || {
-  echo "cannot read kernel release"
-  set_description "failed: cannot read kernel release"
-  exit 1
-}
+REL=$(cat /proc/sys/kernel/osrelease 2>/dev/null) || REL=""
+[ -n "$REL" ] || REL="unknown"
 . "$MODDIR/kmi.sh"
-KMI=$(select_kmi "$REL" "$MODDIR") || {
-  echo "no packaged .ko for kernel: $REL"
-  set_description "failed: no packaged .ko for kernel $REL"
-  exit 1
-}
+# A packaged override wins over the release string, but only when it names a
+# KMI whose .ko is actually in this module; anything else falls back to the
+# automatic path below.
+KMI=$(select_kmi_override "$MODDIR")
+if [ -n "$KMI" ]; then
+  echo "kmi_override: $KMI (kernel $REL)"
+else
+  [ ! -f "$MODDIR/kmi_override" ] || echo "kmi_override invalid; using automatic KMI detection"
+  [ "$REL" != unknown ] || {
+    echo "cannot read kernel release"
+    set_description "failed: cannot read kernel release"
+    exit 1
+  }
+  KMI=$(select_kmi "$REL" "$MODDIR") || {
+    echo "no packaged .ko for kernel: $REL"
+    set_description "failed: no packaged .ko for kernel $REL"
+    exit 1
+  }
+fi
 KO="$MODDIR/lib/susfs_guard_lkm-$KMI.ko"
 [ -s "$KO" ] || {
   echo "missing .ko for $KMI"

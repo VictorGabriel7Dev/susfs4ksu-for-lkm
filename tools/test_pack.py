@@ -33,12 +33,23 @@ def main():
             assert "id=susfs_guard_lkm" in prop and "version=v0.0.0-test" in prop, prop
             assert z.read("kmis").decode().split() == kmis
             assert "early_load" not in names
+            assert "kmi_override" not in names
             provenance = z.read("provenance.json").decode()
             for needle in ('"github_sha": "' + "1" * 40 + '"',
                            '"github_run_id": 12345',
                            '"build_workflow": ".github/workflows/build-ddk.yml"',
                            "sha256:" + "0" * 64):
                 assert needle in provenance, (needle, provenance)
+
+        forced = d / "m-forced.zip"
+        subprocess.run([sys.executable, str(ROOT / "tools/pack_module.py"),
+                        "--ko-dir", str(d), "--insmod", str(d / "susfs_insmod"),
+                        "--tag", "v0.0.0-test", "--kmi-override", "android15-6.6",
+                        "--out", str(forced)], check=True)
+        with zipfile.ZipFile(forced) as z:
+            assert z.read("kmi_override").decode() == "android15-6.6\n"
+            provenance = z.read("provenance.json").decode()
+            assert '"kmi_override": "android15-6.6"' in provenance, provenance
         print("pack test ok")
 
 

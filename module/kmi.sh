@@ -2,6 +2,25 @@
 # SPDX-License-Identifier: GPL-2.0-only
 # Pick the packaged KMI for a kernel release string. The packaged set lives in
 # "$2/kmis" (one <android-os>-<kver> per line), so adding a KMI needs no edit here.
+
+# An operator can force one packaged KMI by putting a single line in
+# "$1/kmi_override".  It is accepted only when that line is one of the packaged
+# KMIs and its .ko is present; anything else (missing, blank, malformed, stale)
+# deliberately returns failure so callers fall back to select_kmi().
+select_kmi_override() {
+  file="$1/kmi_override"
+  [ -f "$file" ] || return 1
+  kmi=$(head -n 1 "$file" 2>/dev/null | tr -d '\r' | tr -d '[:space:]')
+  [ -n "$kmi" ] || return 1
+  while IFS= read -r known; do
+    [ "$known" = "$kmi" ] || continue
+    [ -s "$1/lib/susfs_guard_lkm-$kmi.ko" ] || return 1
+    printf '%s\n' "$kmi"
+    return 0
+  done < "$1/kmis"
+  return 1
+}
+
 select_kmi() {
   rel="$1"
   while IFS= read -r kmi; do

@@ -2,9 +2,16 @@
 # SPDX-License-Identifier: GPL-2.0-only
 [ "$KSU" = true ] || abort "- KernelSU-compatible manager required."
 [ "$ARCH" = arm64 ] || abort "- arm64 only."
-REL=$(cat /proc/sys/kernel/osrelease) || abort "- cannot read kernel release."
+REL=$(cat /proc/sys/kernel/osrelease 2>/dev/null) || REL=""
 . "$MODPATH/kmi.sh"
-KMI=$(select_kmi "$REL" "$MODPATH") || abort "- no packaged .ko for this kernel: $REL"
+KMI=$(select_kmi_override "$MODPATH")
+if [ -n "$KMI" ]; then
+  ui_print "- using packaged kmi_override: $KMI"
+else
+  [ ! -f "$MODPATH/kmi_override" ] || ui_print "- kmi_override invalid; using automatic KMI detection"
+  [ -n "$REL" ] || abort "- cannot read kernel release and no valid kmi_override."
+  KMI=$(select_kmi "$REL" "$MODPATH") || abort "- no packaged .ko for this kernel: $REL"
+fi
 [ -s "$MODPATH/lib/susfs_guard_lkm-$KMI.ko" ] || abort "- missing .ko for $KMI."
 INSTALLED=/data/adb/modules/susfs_guard_lkm
 HOOK=/data/adb/post-fs-data.d/00-susfs-guard-lkm.sh
